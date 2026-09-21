@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Git
+.git/
+.gitignore
+
+# Secrets
+.env
+credentials.json
+
+# Tests
+tests/
+
+# VS Code
+.vscode/
+
+# Images / cache
+*.log
+*.tmp
