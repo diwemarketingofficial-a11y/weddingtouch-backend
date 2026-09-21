@@ -250,7 +250,70 @@ async def delete_team_member(member_id: str, admin: dict = Depends(require_admin
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True}
+@api.post("/events/{event_id}/photos/presign")
+async def presign_event_photo(
+    event_id: str,
+    file_name: str = Form(...),
+    content_type: str = Form(...),
+    admin: dict = Depends(require_admin),
+):
+    # Check that the event exists
+    try:
+        event_oid = ObjectId(event_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid event ID")
 
+    event = await db.events.find_one({"_id": event_oid})
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # Validate image type
+    allowed_types = {
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "image/heic",
+        "image/heif",
+    }
+
+    if content_type not in allowed_types:
+        raise HTTPException(
+            status_code=415,
+            detail="Only JPEG/PNG/WEBP/HEIC accepted",
+        )
+
+    # Keep original extension
+    extension = "jpg"
+
+    if file_name and "." in file_name:
+        extension = file_name.rsplit(".", 1)[-1].lower()
+
+    # Generate unique R2 object name
+    unique_name = f"{uuid.uuid4().hex}.{extension}"
+
+    r2_key = f"events/{event_id}/photos/{unique_name}"
+
+    # Generate temporary direct-upload URL
+    try:
+        upload_url = create_upload_url(
+            key=r2_key,
+            content_type=content_type,
+            expires_in=3600,
+        )
+    except Exception as exc:
+        logging.exception("Failed to create R2 upload URL")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create upload URL: {exc}",
+        )
+
+    return {
+        "upload_url": upload_url,
+        "r2_key": r2_key,
+        "key": r2_key,
+    }
 
 # ---------- Package Routes ----------
 @api.get("/packages")
