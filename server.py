@@ -530,6 +530,92 @@ async def create_event(body: EventCreate, admin: dict = Depends(require_admin)):
     result = await db.events.insert_one(doc)
     doc["_id"] = result.inserted_id
     return serialize(doc)
+@api.get("/events/{event_id}/photo-summary")
+async def get_event_photo_summary(
+    event_id: str,
+    user: dict = Depends(get_current_user),
+):
+    # Make sure event exists
+    try:
+        event_oid = ObjectId(event_id)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid event id",
+        )
+
+    event = await db.events.find_one({
+        "_id": event_oid
+    })
+
+    if not event:
+        raise HTTPException(
+            status_code=404,
+            detail="Event not found",
+        )
+
+    # Total photos
+    photo_count = await db.event_photos.count_documents({
+        "event_id": event_id
+    })
+
+    # Total indexed faces
+    pipeline = [
+        {
+            "$match": {
+                "event_id": event_id
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "total": {
+                    "$sum": {
+                        "$ifNull": [
+                            "$face_count",
+                            0
+                        ]
+                    }
+                }
+            }
+        }
+    ]
+
+    result = await db.event_photos.aggregate(
+        pipeline
+    ).to_list(1)
+
+    face_count = (
+        result[0]["total"]
+        if result
+        else 0
+    )
+
+    # Waiting / currently processing
+    pending_count = await db.event_photos.count_documents({
+        "event_id": event_id,
+        "processing_status": {
+            "$in": [
+                "pending",
+                "processing",
+            ]
+        },
+    })
+
+    # Failed processing
+    failed_count = await db.event_photos.count_documents({
+        "event_id": event_id,
+        "processing_status": "failed",
+    })
+
+    return {
+        "photo_count": photo_count,
+        "face_count": face_count,
+        "pending_count": pending_count,
+        "failed_count": failed_count,
+    }
+
+
 
 
 @api.get("/events")
