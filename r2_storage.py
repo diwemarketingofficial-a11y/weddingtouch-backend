@@ -63,7 +63,12 @@ def create_upload_url(
         },
         ExpiresIn=expires_in,
     )
-
+def download_file(key: str) -> bytes:
+    response = r2.get_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+    )
+    return response["Body"].read()
 def file_exists(key: str) -> bool:
     try:
         r2.head_object(

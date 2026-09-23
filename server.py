@@ -28,6 +28,7 @@ from pydantic import BaseModel, EmailStr, Field, BeforeValidator, ConfigDict
 from face_service import process_image_bytes, encode_selfie, match_encodings
 from r2_storage import (
     upload_file as r2_upload_file,
+    download_file as r2_download_file,
     delete_file as r2_delete_file,
     create_download_url,
     create_upload_url,
@@ -473,6 +474,10 @@ class EventCreate(BaseModel):
 class AlbumSelectionIn(BaseModel):
     photo_ids: List[str]
 
+class PhotoRegisterIn(BaseModel):
+    r2_key: str
+    file_name: str
+    content_type: str
 
 def _client_token_secret() -> str:
     # Reuse main JWT secret but with a distinct token "type" claim
@@ -553,8 +558,179 @@ async def get_event(event_id: str, admin: dict = Depends(require_admin)):
     if not e:
         raise HTTPException(status_code=404, detail="Event not found")
     return serialize(e)
+# Limit face processing so many uploads do not overload the server
+FACE_PROCESSING_SEMAPHORE = asyncio.Semaphore(2)
 
 
+async def process_registered_photo(
+    photo_id: str,
+    event_id: str,
+    r2_key: str,
+):
+    async with FACE_PROCESSING_SEMAPHORE:
+        try:
+            # Mark processing
+            await db.event_photos.update_one(
+                {"_id": ObjectId(photo_id)},
+                {
+                    "$set": {
+                        "processing_status": "processing",
+                        "processing_error": None,
+                    }
+                },
+            )
+
+            logging.info("Starting face processing: %s", photo_id)
+
+            # Download original image from R2
+            raw = await asyncio.to_thread(
+                r2_download_file,
+                r2_key,
+            )
+
+            # Detect faces + create encodings
+            width, height, locations, encodings = await asyncio.to_thread(
+                process_image_bytes,
+                raw,
+            )
+
+            now = now_iso()
+
+            # Remove old encodings if photo is reprocessed
+            await db.face_encodings.delete_many({
+                "photo_id": photo_id
+            })
+
+            enc_docs = []
+
+            for enc, loc in zip(encodings, locations):
+                t, r, b, l = loc
+
+                enc_docs.append({
+                    "event_id": event_id,
+                    "photo_id": photo_id,
+                    "model": "face_recognition-dlib-128-v1",
+                    "embedding": [float(x) for x in enc],
+                    "location": {
+                        "top": int(t),
+                        "right": int(r),
+                        "bottom": int(b),
+                        "left": int(l),
+                    },
+                    "created_at": now,
+                })
+
+            if enc_docs:
+                await db.face_encodings.insert_many(enc_docs)
+
+            # Update photo
+            await db.event_photos.update_one(
+                {"_id": ObjectId(photo_id)},
+                {
+                    "$set": {
+                        "width": width,
+                        "height": height,
+                        "face_count": len(encodings),
+                        "processing_status": "ready",
+                        "processing_error": None,
+                        "processed_at": now,
+                    }
+                },
+            )
+
+            logging.info(
+                "Face processing complete: %s - %d faces",
+                photo_id,
+                len(encodings),
+            )
+
+        except Exception as exc:
+            logging.exception(
+                "Face processing failed for photo %s",
+                photo_id,
+            )
+
+            await db.event_photos.update_one(
+                {"_id": ObjectId(photo_id)},
+                {
+                    "$set": {
+                        "processing_status": "failed",
+                        "processing_error": str(exc),
+                    }
+                },
+            )
+@api.post("/events/{event_id}/photos/register")
+async def register_event_photo(
+    event_id: str,
+    body: PhotoRegisterIn,
+    admin: dict = Depends(require_admin),
+):
+    # Validate event ID
+    try:
+        event_oid = ObjectId(event_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid event ID")
+
+    event = await db.events.find_one({"_id": event_oid})
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # Security: object must belong to this event
+    expected_prefix = f"events/{event_id}/photos/"
+
+    if not body.r2_key.startswith(expected_prefix):
+        raise HTTPException(status_code=400, detail="Invalid R2 key")
+
+    # Avoid registering same R2 object twice
+    existing = await db.event_photos.find_one({
+        "r2_key": body.r2_key
+    })
+
+    if existing:
+        out = serialize(existing)
+        out["image_url"] = create_download_url(
+            body.r2_key,
+            expires_in=3600,
+        )
+        return out
+
+    # Create MongoDB record immediately.
+    # Face recognition will happen separately.
+    photo_doc = {
+        "event_id": event_id,
+        "filename": body.file_name,
+        "content_type": body.content_type,
+        "r2_key": body.r2_key,
+        "width": None,
+        "height": None,
+        "face_count": 0,
+        "processing_status": "pending",
+        "processing_error": None,
+        "created_at": now_iso(),
+    }
+
+    result = await db.event_photos.insert_one(photo_doc)
+
+    photo_doc["_id"] = result.inserted_id
+
+    # Start face recognition in background
+    asyncio.create_task(
+        process_registered_photo(
+            str(result.inserted_id),
+            event_id,
+            body.r2_key,
+        )
+    )
+
+    out = serialize(photo_doc)
+
+    out["image_url"] = create_download_url(
+        body.r2_key,
+        expires_in=3600,
+    )
+
+    return out
 @api.delete("/events/{event_id}")
 async def delete_event(event_id: str, admin: dict = Depends(require_admin)):
     # cascade-delete related photos, encodings, selections
