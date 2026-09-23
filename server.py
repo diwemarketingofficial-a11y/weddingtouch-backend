@@ -1107,16 +1107,35 @@ async def client_search_by_selfie(
         "image/heic",
         "image/heif",
     ):
-        raise HTTPException(status_code=415, detail="Only JPEG/PNG/WEBP/HEIC selfies accepted")
+        raise HTTPException(
+            status_code=415,
+            detail="Only JPEG/PNG/WEBP/HEIC selfies accepted",
+        )
+
     raw = await file.read(15 * 1024 * 1024 + 1)
+
     if len(raw) > 15 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Selfie too large")
+        raise HTTPException(
+            status_code=413,
+            detail="Selfie too large",
+        )
+
+    # ---------------------------------------------------------
+    # Encode selfie
+    # ---------------------------------------------------------
 
     try:
-        encoding, count = await asyncio.to_thread(encode_selfie, raw)
+        encoding, count = await asyncio.to_thread(
+            encode_selfie,
+            raw,
+        )
     except Exception as exc:
         logging.exception("Selfie processing failed")
-        raise HTTPException(status_code=400, detail=f"Selfie processing failed: {exc}")
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selfie processing failed: {exc}",
+        )
 
     if encoding is None:
         raise HTTPException(
@@ -1124,30 +1143,116 @@ async def client_search_by_selfie(
             detail=f"Selfie must contain exactly one face (found {count})",
         )
 
-    # Get event's threshold
-    ev = await db.events.find_one({"_id": ObjectId(claims["event_id"])})
-    threshold = float(ev.get("match_threshold", 0.52)) if ev else 0.52
+    # ---------------------------------------------------------
+    # Get event matching threshold
+    # ---------------------------------------------------------
+
+    try:
+        event_oid = ObjectId(claims["event_id"])
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid event id",
+        )
+
+    ev = await db.events.find_one({
+        "_id": event_oid
+    })
+
+    threshold = (
+        float(ev.get("match_threshold", 0.52))
+        if ev
+        else 0.52
+    )
+
+    # ---------------------------------------------------------
+    # Load stored face encodings
+    # ---------------------------------------------------------
 
     stored = []
-    async for row in db.face_encodings.find({"event_id": claims["event_id"]}):
-        stored.append((row["photo_id"], row["embedding"]))
 
-    photo_scores = await asyncio.to_thread(match_encodings, encoding, stored, threshold)
+    async for row in db.face_encodings.find({
+        "event_id": claims["event_id"]
+    }):
+        stored.append((
+            row["photo_id"],
+            row["embedding"],
+        ))
+
+    # ---------------------------------------------------------
+    # Match selfie against indexed faces
+    # ---------------------------------------------------------
+
+    photo_scores = await asyncio.to_thread(
+        match_encodings,
+        encoding,
+        stored,
+        threshold,
+    )
 
     if not photo_scores:
-        return {"matches": [], "threshold": threshold, "total_faces_scanned": len(stored)}
+        return {
+            "matches": [],
+            "threshold": threshold,
+            "total_faces_scanned": len(stored),
+        }
 
-    ids = [ObjectId(pid) for pid in photo_scores.keys()]
-    photos = await db.event_photos.find({"_id": {"$in": ids}}).to_list(500)
+    # ---------------------------------------------------------
+    # Get matching photo records
+    # ---------------------------------------------------------
+
+    ids = [
+        ObjectId(pid)
+        for pid in photo_scores.keys()
+    ]
+
+    photos = await db.event_photos.find({
+        "_id": {
+            "$in": ids
+        }
+    }).to_list(500)
+
+    # ---------------------------------------------------------
+    # Build response + R2 download URL
+    # ---------------------------------------------------------
+
     out = []
+
     for p in photos:
+
         sp = serialize(p)
-        sp["distance"] = photo_scores.get(str(p["_id"]))
+
+        sp["distance"] = photo_scores.get(
+            str(p["_id"])
+        )
+
+        # IMPORTANT:
+        # Generate temporary R2 URL so browser can display photo
+        if p.get("r2_key"):
+            sp["image_url"] = create_download_url(
+                p["r2_key"],
+                expires_in=3600,
+            )
+
         out.append(sp)
-    out.sort(key=lambda x: x.get("distance", 999))
-    return {"matches": out, "threshold": threshold, "total_faces_scanned": len(stored)}
 
+    # Best matches first
+    out.sort(
+        key=lambda x: x.get(
+            "distance",
+            999,
+        )
+    )
 
+    # ---------------------------------------------------------
+    # Response
+    # ---------------------------------------------------------
+
+    return {
+        "matches": out,
+        "threshold": threshold,
+        "total_faces_scanned": len(stored),
+    }
 # ---------- Album Selection (Bride/Groom portal) ----------
 @api.get("/client/me/album")
 async def client_get_album(claims: dict = Depends(get_client)):
