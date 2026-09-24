@@ -33,6 +33,10 @@ def upload_file(file_bytes: bytes, key: str, content_type: str) -> str:
     )
     return key
 
+def download_file(key: str) -> bytes:
+    response = r2.get_object(Bucket=R2_BUCKET, Key=key)
+    return response["Body"].read()
+
 def delete_file(key: str):
     r2.delete_object(
         Bucket=R2_BUCKET,
@@ -63,12 +67,7 @@ def create_upload_url(
         },
         ExpiresIn=expires_in,
     )
-def download_file(key: str) -> bytes:
-    response = r2.get_object(
-        Bucket=R2_BUCKET,
-        Key=key,
-    )
-    return response["Body"].read()
+
 def file_exists(key: str) -> bool:
     try:
         r2.head_object(

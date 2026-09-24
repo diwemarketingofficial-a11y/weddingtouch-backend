@@ -6,6 +6,8 @@ import uuid
 import base64
 import asyncio
 import logging
+import tempfile
+import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Annotated
 
@@ -20,7 +22,7 @@ import qrcode
 from PIL import Image
 from bson import ObjectId
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field, BeforeValidator, ConfigDict
@@ -135,8 +137,39 @@ class TeamMemberCreate(BaseModel):
     name: str
     email: EmailStr
     password: str
-    role: str = "team"  # "team" or "admin"
+    role: str = "team"
     specialization: Optional[str] = None
+    mobile: Optional[str] = None
+    team_part: Optional[str] = None
+    work_role: Optional[str] = None
+    joining_date: Optional[str] = None
+    monthly_payment: float = 0.0
+    payment_details: Optional[str] = None
+
+
+class TeamMemberUpdate(BaseModel):
+    name: Optional[str] = None
+    mobile: Optional[str] = None
+    role: Optional[str] = None
+    specialization: Optional[str] = None
+    team_part: Optional[str] = None
+    work_role: Optional[str] = None
+    joining_date: Optional[str] = None
+    monthly_payment: Optional[float] = None
+    payment_details: Optional[str] = None
+
+
+class TeamPasswordResetIn(BaseModel):
+    password: str
+
+
+class TeamPaymentIn(BaseModel):
+    amount: float
+    pay_date: str
+    month: str
+    payment_method: Optional[str] = None
+    reference: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class PackageIn(BaseModel):
@@ -162,10 +195,13 @@ class BookingCreate(BaseModel):
 
 class BookingUpdate(BaseModel):
     status: Optional[str] = None  # inquiry, confirmed, in_progress, completed, cancelled
-    assigned_to: Optional[str] = None  # user id
+    assigned_to: Optional[str] = None  # legacy single user id
+    assigned_to_ids: Optional[List[str]] = None  # multiple team member ids
     total_amount: Optional[float] = None
     advance_paid: Optional[float] = None
     notes: Optional[str] = None
+    task_name: Optional[str] = None
+    internal_note: Optional[str] = None
     event_date: Optional[str] = None
     event_time: Optional[str] = None
     location: Optional[str] = None
@@ -219,9 +255,34 @@ async def me(user: dict = Depends(get_current_user)):
 
 # ---------- Team Routes ----------
 @api.get("/team")
-async def list_team(user: dict = Depends(get_current_user)):
+async def list_team(admin: dict = Depends(require_admin)):
     members = await db.users.find({}).to_list(200)
     return [serialize(m) for m in members]
+
+
+@api.get("/team/me/profile")
+async def my_team_profile(user: dict = Depends(get_current_user)):
+    """Read-only profile for the logged-in team member."""
+    return user
+
+
+@api.get("/team/me/payments")
+async def my_team_payments(
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    query = {"member_id": user["id"]}
+    if from_date or to_date:
+        date_query = {}
+        if from_date:
+            date_query["$gte"] = from_date
+        if to_date:
+            date_query["$lte"] = to_date
+        query["pay_date"] = date_query
+    payments = await db.team_payments.find(query).sort("pay_date", -1).to_list(1000)
+    total = sum(float(p.get("amount") or 0) for p in payments)
+    return {"payments": [serialize(p) for p in payments], "total_received": total}
 
 
 @api.post("/team")
@@ -236,11 +297,80 @@ async def create_team_member(body: TeamMemberCreate, admin: dict = Depends(requi
         "password_hash": hash_password(body.password),
         "role": body.role if body.role in ("admin", "team") else "team",
         "specialization": body.specialization,
+        "mobile": body.mobile,
+        "team_part": body.team_part,
+        "work_role": body.work_role,
+        "joining_date": body.joining_date,
+        "monthly_payment": body.monthly_payment,
+        "payment_details": body.payment_details,
         "created_at": now_iso(),
     }
     result = await db.users.insert_one(doc)
     doc["_id"] = result.inserted_id
     return serialize(doc)
+
+
+@api.patch("/team/{member_id}")
+async def update_team_member(member_id: str, body: TeamMemberUpdate, admin: dict = Depends(require_admin)):
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if updates.get("role") not in (None, "admin", "team"):
+        updates["role"] = "team"
+    updates["updated_at"] = now_iso()
+    await db.users.update_one({"_id": ObjectId(member_id)}, {"$set": updates})
+    member = await db.users.find_one({"_id": ObjectId(member_id)})
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    return serialize(member)
+
+
+@api.get("/team/{member_id}/payments")
+async def list_team_payments(member_id: str, admin: dict = Depends(require_admin)):
+    payments = await db.team_payments.find({"member_id": member_id}).sort("pay_date", -1).to_list(500)
+    return [serialize(x) for x in payments]
+
+
+@api.post("/team/{member_id}/payments")
+async def add_team_payment(member_id: str, body: TeamPaymentIn, admin: dict = Depends(require_admin)):
+    member = await db.users.find_one({"_id": ObjectId(member_id)})
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    doc = body.model_dump()
+    doc.update({"member_id": member_id, "created_at": now_iso()})
+    result = await db.team_payments.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return serialize(doc)
+
+
+@api.post("/team/{member_id}/reset-password")
+async def reset_team_password(member_id: str, body: TeamPasswordResetIn, admin: dict = Depends(require_admin)):
+    if len(body.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    result = await db.users.update_one({"_id": ObjectId(member_id)}, {"$set": {"password_hash": hash_password(body.password), "updated_at": now_iso()}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    return {"ok": True}
+
+
+# IMPORTANT: keep the literal /team/me/tasks route BEFORE /team/{member_id}/tasks.
+# FastAPI matches routes in declaration order; otherwise "me" is treated as a member_id.
+@api.get("/team/me/tasks")
+async def my_team_tasks(user: dict = Depends(get_current_user)):
+    member_id = user["id"]
+    query = {"$or": [{"assigned_to": member_id}, {"assigned_to_ids": member_id}]}
+    bookings = await db.bookings.find(query).to_list(500)
+    bookings.sort(key=lambda b: (str(b.get("event_date") or ""), str(b.get("event_time") or "")))
+    return [serialize(b) for b in bookings]
+
+
+@api.get("/team/{member_id}/tasks")
+async def team_member_tasks(member_id: str, user: dict = Depends(get_current_user)):
+    # Team members can see their own tasks; admins can inspect anyone.
+    if user.get("role") != "admin" and user.get("id") != member_id:
+        raise HTTPException(status_code=403, detail="You can only view your own tasks")
+    query = {"$or": [{"assigned_to": member_id}, {"assigned_to_ids": member_id}]}
+    bookings = await db.bookings.find(query).to_list(500)
+    bookings.sort(key=lambda b: (str(b.get("event_date") or ""), str(b.get("event_time") or "")))
+    return [serialize(b) for b in bookings]
 
 
 @api.delete("/team/{member_id}")
@@ -256,7 +386,7 @@ async def presign_event_photo(
     event_id: str,
     file_name: str = Form(...),
     content_type: str = Form(...),
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(get_current_user),
 ):
     # Check that the event exists
     try:
@@ -349,6 +479,102 @@ async def delete_package(package_id: str, admin: dict = Depends(require_admin)):
     return {"ok": True}
 
 
+# ---------- Booking PDF + WhatsApp helpers ----------
+def _money(value) -> str:
+    try:
+        return f"INR {float(value or 0):,.2f}"
+    except Exception:
+        return "INR 0.00"
+
+
+def _booking_pdf_bytes(booking: dict) -> bytes:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
+    styles = getSampleStyleSheet()
+    total = float(booking.get("total_amount") or 0)
+    paid = float(booking.get("advance_paid") or 0)
+    due = max(total - paid, 0)
+    rows = [
+        ["Client", booking.get("client_name", "")],
+        ["Phone", booking.get("client_phone", "")],
+        ["Event", booking.get("event_type", "")],
+        ["Event date", booking.get("event_date", "")],
+        ["Location", booking.get("location", "") or ""],
+        ["Status", booking.get("status", "")],
+        ["Total booking amount", _money(total)],
+        ["Payment amount", _money(paid)],
+        ["Due amount", _money(due)],
+    ]
+    table = Table(rows, colWidths=[55*mm, 105*mm])
+    table.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.4, colors.grey),
+        ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("PADDING", (0,0), (-1,-1), 7),
+    ]))
+    story = [Paragraph("Wedding Touch - Booking Update", styles["Title"]), Spacer(1, 8*mm), table]
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _send_whatsapp_booking_sync(booking: dict) -> dict:
+    token = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v23.0").strip()
+    phone = "".join(ch for ch in str(booking.get("client_phone") or "") if ch.isdigit())
+    if phone.startswith("0") and os.getenv("WHATSAPP_DEFAULT_COUNTRY_CODE"):
+        phone = os.getenv("WHATSAPP_DEFAULT_COUNTRY_CODE").strip() + phone.lstrip("0")
+    if not token or not phone_number_id or not phone:
+        return {"status": "not_configured"}
+
+    total = float(booking.get("total_amount") or 0)
+    paid = float(booking.get("advance_paid") or 0)
+    due = max(total - paid, 0)
+    message = (
+        f"Wedding Touch booking update\n"
+        f"Client: {booking.get('client_name', '')}\n"
+        f"Event date: {booking.get('event_date', '')}\n"
+        f"Total booking amount: {_money(total)}\n"
+        f"Payment amount: {_money(paid)}\n"
+        f"Due amount: {_money(due)}\n"
+        f"Status: {booking.get('status', '')}"
+    )
+    base = f"https://graph.facebook.com/{api_version}/{phone_number_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    text_resp = requests.post(
+        f"{base}/messages",
+        headers={**headers, "Content-Type": "application/json"},
+        json={"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": message}},
+        timeout=30,
+    )
+    text_resp.raise_for_status()
+
+    pdf = _booking_pdf_bytes(booking)
+    media_resp = requests.post(
+        f"{base}/media",
+        headers=headers,
+        data={"messaging_product": "whatsapp", "type": "application/pdf"},
+        files={"file": (f"booking-{booking.get('_id', 'update')}.pdf", pdf, "application/pdf")},
+        timeout=60,
+    )
+    media_resp.raise_for_status()
+    media_id = media_resp.json()["id"]
+    doc_resp = requests.post(
+        f"{base}/messages",
+        headers={**headers, "Content-Type": "application/json"},
+        json={"messaging_product": "whatsapp", "to": phone, "type": "document", "document": {"id": media_id, "filename": "Wedding-Touch-Booking.pdf", "caption": "Your latest Wedding Touch booking details"}},
+        timeout=30,
+    )
+    doc_resp.raise_for_status()
+    return {"status": "sent"}
+
+
 # ---------- Booking Routes ----------
 @api.post("/bookings")
 async def create_booking(body: BookingCreate):
@@ -370,14 +596,19 @@ async def list_bookings(user: dict = Depends(get_current_user)):
     result = []
     for b in bookings:
         b = serialize(b)
-        # attach assigned member name
-        if b.get("assigned_to"):
+        # attach assigned team member names (supports legacy single assignment)
+        assigned_ids = b.get("assigned_to_ids") or ([b.get("assigned_to")] if b.get("assigned_to") else [])
+        assigned_ids = [x for x in assigned_ids if x]
+        names = []
+        for member_id in assigned_ids:
             try:
-                mem = await db.users.find_one({"_id": ObjectId(b["assigned_to"])})
+                mem = await db.users.find_one({"_id": ObjectId(member_id)})
                 if mem:
-                    b["assigned_name"] = mem.get("name")
+                    names.append(mem.get("name"))
             except Exception:
                 pass
+        b["assigned_names"] = names
+        b["assigned_name"] = ", ".join(names) if names else None
         result.append(b)
     return result
 
@@ -400,7 +631,27 @@ async def update_booking(booking_id: str, body: BookingUpdate, user: dict = Depe
     updated = await db.bookings.find_one({"_id": ObjectId(booking_id)})
     if not updated:
         raise HTTPException(status_code=404, detail="Not found")
-    return serialize(updated)
+
+    # Every successful booking-sheet update can notify the client. If WhatsApp
+    # credentials are not configured, the booking update still succeeds.
+    whatsapp = {"status": "not_configured"}
+    try:
+        whatsapp = await asyncio.to_thread(_send_whatsapp_booking_sync, updated)
+    except Exception as exc:
+        logging.exception("WhatsApp booking notification failed")
+        whatsapp = {"status": "failed", "detail": str(exc)}
+    result = serialize(updated)
+    result["whatsapp"] = whatsapp
+    return result
+
+
+@api.get("/bookings/{booking_id}/pdf")
+async def booking_pdf(booking_id: str, user: dict = Depends(get_current_user)):
+    booking = await db.bookings.find_one({"_id": ObjectId(booking_id)})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Not found")
+    pdf = await asyncio.to_thread(_booking_pdf_bytes, booking)
+    return Response(content=pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="booking-{booking_id}.pdf"'})
 
 
 @api.delete("/bookings/{booking_id}")
@@ -484,11 +735,12 @@ def _client_token_secret() -> str:
     return os.environ["JWT_SECRET"]
 
 
-def _make_client_token(event_id: str, booking_id: str, minutes: int = 60 * 24 * 30) -> str:
+def _make_client_token(event_id: str, booking_id: str, access_mode: str = "guest", minutes: int = 60 * 24 * 30) -> str:
     payload = {
         "type": "client",
         "event_id": event_id,
         "booking_id": booking_id,
+        "access_mode": access_mode,
         "iat": datetime.now(timezone.utc),
         "exp": datetime.now(timezone.utc) + timedelta(minutes=minutes),
         "jti": uuid.uuid4().hex,
@@ -520,7 +772,7 @@ async def get_client(request: Request) -> dict:
 
 
 @api.post("/events")
-async def create_event(body: EventCreate, admin: dict = Depends(require_admin)):
+async def create_event(body: EventCreate, user: dict = Depends(get_current_user)):
     doc = {
         "title": body.title,
         "booking_id": body.booking_id,
@@ -530,96 +782,10 @@ async def create_event(body: EventCreate, admin: dict = Depends(require_admin)):
     result = await db.events.insert_one(doc)
     doc["_id"] = result.inserted_id
     return serialize(doc)
-@api.get("/events/{event_id}/photo-summary")
-async def get_event_photo_summary(
-    event_id: str,
-    user: dict = Depends(get_current_user),
-):
-    # Make sure event exists
-    try:
-        event_oid = ObjectId(event_id)
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid event id",
-        )
-
-    event = await db.events.find_one({
-        "_id": event_oid
-    })
-
-    if not event:
-        raise HTTPException(
-            status_code=404,
-            detail="Event not found",
-        )
-
-    # Total photos
-    photo_count = await db.event_photos.count_documents({
-        "event_id": event_id
-    })
-
-    # Total indexed faces
-    pipeline = [
-        {
-            "$match": {
-                "event_id": event_id
-            }
-        },
-        {
-            "$group": {
-                "_id": None,
-                "total": {
-                    "$sum": {
-                        "$ifNull": [
-                            "$face_count",
-                            0
-                        ]
-                    }
-                }
-            }
-        }
-    ]
-
-    result = await db.event_photos.aggregate(
-        pipeline
-    ).to_list(1)
-
-    face_count = (
-        result[0]["total"]
-        if result
-        else 0
-    )
-
-    # Waiting / currently processing
-    pending_count = await db.event_photos.count_documents({
-        "event_id": event_id,
-        "processing_status": {
-            "$in": [
-                "pending",
-                "processing",
-            ]
-        },
-    })
-
-    # Failed processing
-    failed_count = await db.event_photos.count_documents({
-        "event_id": event_id,
-        "processing_status": "failed",
-    })
-
-    return {
-        "photo_count": photo_count,
-        "face_count": face_count,
-        "pending_count": pending_count,
-        "failed_count": failed_count,
-    }
-
-
 
 
 @api.get("/events")
-async def list_events(admin: dict = Depends(require_admin)):
+async def list_events(user: dict = Depends(get_current_user)):
     events = await db.events.find({}).sort("created_at", -1).to_list(500)
     out = []
     for e in events:
@@ -639,7 +805,7 @@ async def list_events(admin: dict = Depends(require_admin)):
 
 
 @api.get("/events/{event_id}")
-async def get_event(event_id: str, admin: dict = Depends(require_admin)):
+async def get_event(event_id: str, user: dict = Depends(get_current_user)):
     e = await db.events.find_one({"_id": ObjectId(event_id)})
     if not e:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -749,7 +915,7 @@ async def process_registered_photo(
 async def register_event_photo(
     event_id: str,
     body: PhotoRegisterIn,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(get_current_user),
 ):
     # Validate event ID
     try:
@@ -833,7 +999,7 @@ async def delete_event(event_id: str, admin: dict = Depends(require_admin)):
 async def upload_event_photo(
     event_id: str,
     file: UploadFile = File(...),
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(get_current_user),
 ):
     ev = await db.events.find_one({"_id": ObjectId(event_id)})
 
@@ -974,7 +1140,7 @@ async def upload_event_photo(
 @api.get("/events/{event_id}/photos")
 async def list_event_photos(
     event_id: str,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(get_current_user),
 ):
     photos = (
         await db.event_photos.find({"event_id": event_id})
@@ -1007,6 +1173,23 @@ async def list_event_photos(
     return result
 
 
+@api.get("/events/{event_id}/photo-summary")
+async def get_event_photo_summary(event_id: str, user: dict = Depends(get_current_user)):
+    try:
+        event_oid = ObjectId(event_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid event id")
+    if not await db.events.find_one({"_id": event_oid}):
+        raise HTTPException(status_code=404, detail="Event not found")
+    photo_count = await db.event_photos.count_documents({"event_id": event_id})
+    pipeline = [{"$match":{"event_id":event_id}}, {"$group":{"_id":None,"total":{"$sum":{"$ifNull":["$face_count",0]}}}}]
+    result = await db.event_photos.aggregate(pipeline).to_list(1)
+    face_count = result[0]["total"] if result else 0
+    pending_count = await db.event_photos.count_documents({"event_id":event_id,"processing_status":{"$in":["pending","processing"]}})
+    failed_count = await db.event_photos.count_documents({"event_id":event_id,"processing_status":"failed"})
+    return {"photo_count":photo_count,"face_count":face_count,"pending_count":pending_count,"failed_count":failed_count}
+
+
 @api.delete("/events/{event_id}/photos/{photo_id}")
 async def delete_event_photo(event_id: str, photo_id: str, admin: dict = Depends(require_admin)):
     await db.face_encodings.delete_many({"photo_id": photo_id})
@@ -1020,7 +1203,8 @@ async def delete_event_photo(event_id: str, photo_id: str, admin: dict = Depends
 async def generate_client_qr(
     event_id: str,
     booking_id: str = Form(...),
-    admin: dict = Depends(require_admin),
+    access_mode: str = Form("guest"),
+    user: dict = Depends(get_current_user),
 ):
     ev = await db.events.find_one({"_id": ObjectId(event_id)})
     if not ev:
@@ -1029,7 +1213,8 @@ async def generate_client_qr(
     if not b:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    token = _make_client_token(event_id=event_id, booking_id=booking_id)
+    access_mode = "album" if access_mode == "album" else "guest"
+    token = _make_client_token(event_id=event_id, booking_id=booking_id, access_mode=access_mode)
     base_url = os.environ.get("PORTAL_BASE_URL", "").rstrip("/")
     url = f"{base_url}/client/scan?token={token}" if base_url else f"/client/scan?token={token}"
 
@@ -1037,7 +1222,7 @@ async def generate_client_qr(
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-    return {"qr": data_url, "url": url, "token": token, "client_name": b.get("client_name")}
+    return {"qr": data_url, "url": url, "token": token, "client_name": b.get("client_name"), "access_mode": access_mode}
 
 
 @api.post("/client/scan")
@@ -1052,6 +1237,7 @@ async def client_scan(token: str = Form(...)):
             "event": {"id": str(ev["_id"]), "title": ev.get("title")},
             "booking": {"id": str(b["_id"]), "client_name": b.get("client_name")},
             "token": token,
+            "access_mode": payload.get("access_mode", "guest"),
         }
     )
     resp.set_cookie(
@@ -1073,6 +1259,7 @@ async def client_me(claims: dict = Depends(get_client)):
     return {
         "event": serialize(ev) if ev else None,
         "booking": serialize(b) if b else None,
+        "access_mode": claims.get("access_mode", "guest"),
     }
 
 
@@ -1085,13 +1272,21 @@ async def client_logout():
 
 @api.get("/client/me/photos")
 async def client_list_photos(claims: dict = Depends(get_client)):
-    """Return ALL event photos for the client's event (used by album selection)."""
+    """Return all event photos only to the dedicated Album Selection QR."""
+    if claims.get("access_mode") != "album":
+        raise HTTPException(status_code=403, detail="Use the Album Selection QR")
     photos = (
         await db.event_photos.find({"event_id": claims["event_id"]})
         .sort("created_at", -1)
         .to_list(2000)
     )
-    return [serialize(p) for p in photos]
+    out = []
+    for p in photos:
+        item = serialize(p)
+        if p.get("r2_key"):
+            item["image_url"] = create_download_url(p["r2_key"], expires_in=3600)
+        out.append(item)
+    return out
 
 
 @api.post("/client/me/photos/search")
@@ -1099,6 +1294,8 @@ async def client_search_by_selfie(
     file: UploadFile = File(...),
     claims: dict = Depends(get_client),
 ):
+    if claims.get("access_mode", "guest") == "album":
+        raise HTTPException(status_code=403, detail="Album QR does not allow selfie search")
     if file.content_type not in (
         "image/jpeg",
         "image/png",
@@ -1107,35 +1304,16 @@ async def client_search_by_selfie(
         "image/heic",
         "image/heif",
     ):
-        raise HTTPException(
-            status_code=415,
-            detail="Only JPEG/PNG/WEBP/HEIC selfies accepted",
-        )
-
+        raise HTTPException(status_code=415, detail="Only JPEG/PNG/WEBP/HEIC selfies accepted")
     raw = await file.read(15 * 1024 * 1024 + 1)
-
     if len(raw) > 15 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Selfie too large",
-        )
-
-    # ---------------------------------------------------------
-    # Encode selfie
-    # ---------------------------------------------------------
+        raise HTTPException(status_code=413, detail="Selfie too large")
 
     try:
-        encoding, count = await asyncio.to_thread(
-            encode_selfie,
-            raw,
-        )
+        encoding, count = await asyncio.to_thread(encode_selfie, raw)
     except Exception as exc:
         logging.exception("Selfie processing failed")
-
-        raise HTTPException(
-            status_code=400,
-            detail=f"Selfie processing failed: {exc}",
-        )
+        raise HTTPException(status_code=400, detail=f"Selfie processing failed: {exc}")
 
     if encoding is None:
         raise HTTPException(
@@ -1143,119 +1321,37 @@ async def client_search_by_selfie(
             detail=f"Selfie must contain exactly one face (found {count})",
         )
 
-    # ---------------------------------------------------------
-    # Get event matching threshold
-    # ---------------------------------------------------------
-
-    try:
-        event_oid = ObjectId(claims["event_id"])
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid event id",
-        )
-
-    ev = await db.events.find_one({
-        "_id": event_oid
-    })
-
-    threshold = (
-        float(ev.get("match_threshold", 0.52))
-        if ev
-        else 0.52
-    )
-
-    # ---------------------------------------------------------
-    # Load stored face encodings
-    # ---------------------------------------------------------
+    # Get event's threshold
+    ev = await db.events.find_one({"_id": ObjectId(claims["event_id"])})
+    threshold = float(ev.get("match_threshold", 0.52)) if ev else 0.52
 
     stored = []
+    async for row in db.face_encodings.find({"event_id": claims["event_id"]}):
+        stored.append((row["photo_id"], row["embedding"]))
 
-    async for row in db.face_encodings.find({
-        "event_id": claims["event_id"]
-    }):
-        stored.append((
-            row["photo_id"],
-            row["embedding"],
-        ))
-
-    # ---------------------------------------------------------
-    # Match selfie against indexed faces
-    # ---------------------------------------------------------
-
-    photo_scores = await asyncio.to_thread(
-        match_encodings,
-        encoding,
-        stored,
-        threshold,
-    )
+    photo_scores = await asyncio.to_thread(match_encodings, encoding, stored, threshold)
 
     if not photo_scores:
-        return {
-            "matches": [],
-            "threshold": threshold,
-            "total_faces_scanned": len(stored),
-        }
+        return {"matches": [], "threshold": threshold, "total_faces_scanned": len(stored)}
 
-    # ---------------------------------------------------------
-    # Get matching photo records
-    # ---------------------------------------------------------
-
-    ids = [
-        ObjectId(pid)
-        for pid in photo_scores.keys()
-    ]
-
-    photos = await db.event_photos.find({
-        "_id": {
-            "$in": ids
-        }
-    }).to_list(500)
-
-    # ---------------------------------------------------------
-    # Build response + R2 download URL
-    # ---------------------------------------------------------
-
+    ids = [ObjectId(pid) for pid in photo_scores.keys()]
+    photos = await db.event_photos.find({"_id": {"$in": ids}}).to_list(500)
     out = []
-
     for p in photos:
-
         sp = serialize(p)
-
-        sp["distance"] = photo_scores.get(
-            str(p["_id"])
-        )
-
-        # IMPORTANT:
-        # Generate temporary R2 URL so browser can display photo
+        sp["distance"] = photo_scores.get(str(p["_id"]))
         if p.get("r2_key"):
-            sp["image_url"] = create_download_url(
-                p["r2_key"],
-                expires_in=3600,
-            )
-
+            sp["image_url"] = create_download_url(p["r2_key"], expires_in=3600)
         out.append(sp)
+    out.sort(key=lambda x: x.get("distance", 999))
+    return {"matches": out, "threshold": threshold, "total_faces_scanned": len(stored)}
 
-    # Best matches first
-    out.sort(
-        key=lambda x: x.get(
-            "distance",
-            999,
-        )
-    )
 
-    # ---------------------------------------------------------
-    # Response
-    # ---------------------------------------------------------
-
-    return {
-        "matches": out,
-        "threshold": threshold,
-        "total_faces_scanned": len(stored),
-    }
 # ---------- Album Selection (Bride/Groom portal) ----------
 @api.get("/client/me/album")
 async def client_get_album(claims: dict = Depends(get_client)):
+    if claims.get("access_mode") != "album":
+        raise HTTPException(status_code=403, detail="Use the Album Selection QR")
     sel = await db.album_selections.find_one(
         {"event_id": claims["event_id"], "booking_id": claims["booking_id"]}
     )
@@ -1264,6 +1360,8 @@ async def client_get_album(claims: dict = Depends(get_client)):
 
 @api.post("/client/me/album")
 async def client_save_album(body: AlbumSelectionIn, claims: dict = Depends(get_client)):
+    if claims.get("access_mode") != "album":
+        raise HTTPException(status_code=403, detail="Use the Album Selection QR")
     now = now_iso()
     await db.album_selections.update_one(
         {"event_id": claims["event_id"], "booking_id": claims["booking_id"]},
@@ -1286,7 +1384,7 @@ async def client_save_album(body: AlbumSelectionIn, claims: dict = Depends(get_c
 
 
 @api.get("/events/{event_id}/album-selections")
-async def admin_list_album_selections(event_id: str, admin: dict = Depends(require_admin)):
+async def admin_list_album_selections(event_id: str, user: dict = Depends(get_current_user)):
     sels = await db.album_selections.find({"event_id": event_id}).to_list(200)
     out = []
     for s in sels:
@@ -1300,6 +1398,31 @@ async def admin_list_album_selections(event_id: str, admin: dict = Depends(requi
             except Exception:
                 pass
         out.append(s)
+    return out
+
+
+@api.get("/events/{event_id}/album-selections/{selection_id}/photos")
+async def admin_album_selection_photos(event_id: str, selection_id: str, user: dict = Depends(get_current_user)):
+    sel = await db.album_selections.find_one({"_id": ObjectId(selection_id), "event_id": event_id})
+    if not sel:
+        raise HTTPException(status_code=404, detail="Album selection not found")
+    ids = []
+    for pid in sel.get("photo_ids", []):
+        try:
+            ids.append(ObjectId(pid))
+        except Exception:
+            pass
+    photos = await db.event_photos.find({"_id": {"$in": ids}, "event_id": event_id}).to_list(2000) if ids else []
+    by_id = {str(p["_id"]): p for p in photos}
+    out = []
+    for pid in sel.get("photo_ids", []):
+        p = by_id.get(pid)
+        if not p:
+            continue
+        item = serialize(p)
+        if p.get("r2_key"):
+            item["image_url"] = create_download_url(p["r2_key"], expires_in=3600)
+        out.append(item)
     return out
 
 
@@ -1368,6 +1491,7 @@ async def startup_event():
     await db.face_encodings.create_index("event_id")
     await db.face_encodings.create_index("photo_id")
     await db.album_selections.create_index([("event_id", 1), ("booking_id", 1)])
+    await db.team_payments.create_index([("member_id", 1), ("month", 1)])
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@lensstudio.com").lower()
