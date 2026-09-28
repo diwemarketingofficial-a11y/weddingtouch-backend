@@ -122,8 +122,14 @@ async def get_current_user(request: Request) -> dict:
 
 
 async def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    if user.get("role") != "admin":
+    if user.get("role") not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+async def require_super_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
     return user
 
 
@@ -179,6 +185,8 @@ class PackageIn(BaseModel):
     price: float
     features: List[str] = []
     duration: Optional[str] = None
+    image_data: Optional[str] = None
+    image_key: Optional[str] = None
 
 
 class BookingCreate(BaseModel):
@@ -210,7 +218,80 @@ class BookingUpdate(BaseModel):
 class GalleryImageIn(BaseModel):
     title: str
     category: str
-    image_data: str  # base64 data URL
+    image_data: Optional[str] = None  # legacy/base64 compatibility
+    image_key: Optional[str] = None
+
+
+class GalleryImageUpdate(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class PortfolioCategoryIn(BaseModel):
+    name: str
+    sort_order: int = 0
+    is_active: bool = True
+
+
+class PortfolioCategoryUpdate(BaseModel):
+    name: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class PackageCategoryIn(BaseModel):
+    name: str
+    sort_order: int = 0
+    is_active: bool = True
+
+
+class PackageCategoryUpdate(BaseModel):
+    name: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+
+class ReelIn(BaseModel):
+    title: str
+    tag: Optional[str] = "WEDDING FILM"
+    image_data: Optional[str] = None
+    image_key: Optional[str] = None
+    video_url: str
+    is_active: bool = True
+
+class ReelUpdate(BaseModel):
+    title: Optional[str] = None
+    tag: Optional[str] = None
+    image_data: Optional[str] = None
+    image_key: Optional[str] = None
+    video_url: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class BlogPostIn(BaseModel):
+    title: str
+    slug: str
+    excerpt: str
+    content: str
+    image_key: Optional[str] = None
+    tag: Optional[str] = "Guide"
+    is_active: bool = True
+
+class ReviewIn(BaseModel):
+    name: str
+    image_data: Optional[str] = None
+    rating: int = Field(ge=1, le=5)
+    review: str
+    image_key: Optional[str] = None
+    event_type: Optional[str] = None
+    is_active: bool = True
+
+class SuperAdminCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    mobile: Optional[str] = None
 
 
 # ---------- App ----------
@@ -231,7 +312,7 @@ async def login(body: LoginIn):
         key="access_token",
         value=token,
         httponly=True,
-        secure=False,
+        secure=os.getenv("COOKIE_SECURE", "true").lower() == "true",
         samesite="lax",
         max_age=60 * 60 * 24 * 7,
         path="/",
@@ -256,7 +337,7 @@ async def me(user: dict = Depends(get_current_user)):
 # ---------- Team Routes ----------
 @api.get("/team")
 async def list_team(admin: dict = Depends(require_admin)):
-    members = await db.users.find({}).to_list(200)
+    members = await db.users.find({"role": {"$ne": "super_admin"}}).to_list(200)
     return [serialize(m) for m in members]
 
 
@@ -316,8 +397,8 @@ async def update_team_member(member_id: str, body: TeamMemberUpdate, admin: dict
     if updates.get("role") not in (None, "admin", "team"):
         updates["role"] = "team"
     updates["updated_at"] = now_iso()
-    await db.users.update_one({"_id": ObjectId(member_id)}, {"$set": updates})
-    member = await db.users.find_one({"_id": ObjectId(member_id)})
+    await db.users.update_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}}, {"$set": updates})
+    member = await db.users.find_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}})
     if not member:
         raise HTTPException(status_code=404, detail="Team member not found")
     return serialize(member)
@@ -331,7 +412,7 @@ async def list_team_payments(member_id: str, admin: dict = Depends(require_admin
 
 @api.post("/team/{member_id}/payments")
 async def add_team_payment(member_id: str, body: TeamPaymentIn, admin: dict = Depends(require_admin)):
-    member = await db.users.find_one({"_id": ObjectId(member_id)})
+    member = await db.users.find_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}})
     if not member:
         raise HTTPException(status_code=404, detail="Team member not found")
     doc = body.model_dump()
@@ -345,7 +426,7 @@ async def add_team_payment(member_id: str, body: TeamPaymentIn, admin: dict = De
 async def reset_team_password(member_id: str, body: TeamPasswordResetIn, admin: dict = Depends(require_admin)):
     if len(body.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    result = await db.users.update_one({"_id": ObjectId(member_id)}, {"$set": {"password_hash": hash_password(body.password), "updated_at": now_iso()}})
+    result = await db.users.update_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}}, {"$set": {"password_hash": hash_password(body.password), "updated_at": now_iso()}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Team member not found")
     return {"ok": True}
@@ -365,7 +446,7 @@ async def my_team_tasks(user: dict = Depends(get_current_user)):
 @api.get("/team/{member_id}/tasks")
 async def team_member_tasks(member_id: str, user: dict = Depends(get_current_user)):
     # Team members can see their own tasks; admins can inspect anyone.
-    if user.get("role") != "admin" and user.get("id") != member_id:
+    if user.get("role") not in ("admin", "super_admin") and user.get("id") != member_id:
         raise HTTPException(status_code=403, detail="You can only view your own tasks")
     query = {"$or": [{"assigned_to": member_id}, {"assigned_to_ids": member_id}]}
     bookings = await db.bookings.find(query).to_list(500)
@@ -377,7 +458,7 @@ async def team_member_tasks(member_id: str, user: dict = Depends(get_current_use
 async def delete_team_member(member_id: str, admin: dict = Depends(require_admin)):
     if member_id == admin["id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    result = await db.users.delete_one({"_id": ObjectId(member_id)})
+    result = await db.users.delete_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True}
@@ -446,11 +527,55 @@ async def presign_event_photo(
         "key": r2_key,
     }
 
+# ---------- Optimized website media ----------
+def _media_doc(doc: dict) -> dict:
+    row = serialize(doc)
+    key = row.get("image_key")
+    if key:
+        try:
+            row["image_data"] = create_download_url(key, expires_in=86400)
+        except Exception:
+            logging.exception("Could not sign website media URL")
+    return row
+
+@api.post("/media/website")
+async def upload_website_media(
+    file: UploadFile = File(...),
+    kind: str = Form("gallery"),
+    admin: dict = Depends(require_admin),
+):
+    """Optimize website artwork to WebP and store it in R2.
+    Originals are intentionally not served to public pages.
+    """
+    allowed = {"gallery", "portfolio", "service", "reel", "website", "blog", "review"}
+    if kind not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid media type")
+    raw = await file.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image must be 10MB or smaller")
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        # Website artwork never needs camera-original dimensions.
+        max_side = 1920 if kind == "website" else 1400
+        img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        if img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, "white"); bg.paste(img, mask=img.getchannel("A")); img = bg
+        out = io.BytesIO()
+        img.save(out, format="WEBP", quality=78, method=4, optimize=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}")
+    key = f"website/{kind}/{uuid.uuid4().hex}.webp"
+    await asyncio.to_thread(r2_upload_file, out.getvalue(), key, "image/webp")
+    return {"image_key": key, "image_url": create_download_url(key, expires_in=86400), "bytes": len(out.getvalue())}
+
 # ---------- Package Routes ----------
 @api.get("/packages")
 async def list_packages():
     packages = await db.packages.find({}).to_list(200)
-    return [serialize(p) for p in packages]
+    return [_media_doc(p) for p in packages]
 
 
 @api.post("/packages")
@@ -459,7 +584,7 @@ async def create_package(body: PackageIn, admin: dict = Depends(require_admin)):
     doc["created_at"] = now_iso()
     result = await db.packages.insert_one(doc)
     doc["_id"] = result.inserted_id
-    return serialize(doc)
+    return _media_doc(doc)
 
 
 @api.put("/packages/{package_id}")
@@ -468,7 +593,7 @@ async def update_package(package_id: str, body: PackageIn, admin: dict = Depends
     updated = await db.packages.find_one({"_id": ObjectId(package_id)})
     if not updated:
         raise HTTPException(status_code=404, detail="Not found")
-    return serialize(updated)
+    return _media_doc(updated)
 
 
 @api.delete("/packages/{package_id}")
@@ -662,29 +787,252 @@ async def delete_booking(booking_id: str, admin: dict = Depends(require_admin)):
     return {"ok": True}
 
 
-# ---------- Gallery Routes ----------
+# ---------- Gallery + Website Master Data Routes ----------
+DEFAULT_PORTFOLIO_CATEGORIES = ["Wedding", "Pre-wedding", "Portrait", "Event", "Commercial"]
+
+@api.get("/master/portfolio-categories")
+async def list_portfolio_categories(include_inactive: bool = False):
+    query = {} if include_inactive else {"is_active": {"$ne": False}}
+    rows = await db.portfolio_categories.find(query).sort([("sort_order", 1), ("name", 1)]).to_list(200)
+    if not rows:
+        return [{"id": f"default-{i}", "name": n, "sort_order": i + 1, "is_active": True} for i, n in enumerate(DEFAULT_PORTFOLIO_CATEGORIES)]
+    return [_media_doc(x) for x in rows]
+
+@api.post("/master/portfolio-categories")
+async def create_portfolio_category(body: PortfolioCategoryIn, super_admin: dict = Depends(require_super_admin)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Category name is required")
+    if await db.portfolio_categories.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}}):
+        raise HTTPException(status_code=400, detail="Category already exists")
+    doc = {"name": name, "sort_order": body.sort_order, "is_active": body.is_active, "created_at": now_iso()}
+    result = await db.portfolio_categories.insert_one(doc); doc["_id"] = result.inserted_id
+    return serialize(doc)
+
+@api.patch("/master/portfolio-categories/{category_id}")
+async def update_portfolio_category(category_id: str, body: PortfolioCategoryUpdate, super_admin: dict = Depends(require_super_admin)):
+    if category_id.startswith("default-"):
+        raise HTTPException(status_code=400, detail="Save a new category first; default categories cannot be edited until initialized")
+    old = await db.portfolio_categories.find_one({"_id": ObjectId(category_id)})
+    if not old: raise HTTPException(status_code=404, detail="Category not found")
+    updates = {k:v for k,v in body.model_dump().items() if v is not None}
+    if "name" in updates:
+        updates["name"] = updates["name"].strip()
+        if not updates["name"]: raise HTTPException(status_code=400, detail="Category name is required")
+        await db.gallery.update_many({"category": old["name"]}, {"$set": {"category": updates["name"]}})
+    updates["updated_at"] = now_iso()
+    await db.portfolio_categories.update_one({"_id": old["_id"]}, {"$set": updates})
+    return serialize(await db.portfolio_categories.find_one({"_id": old["_id"]}))
+
+@api.delete("/master/portfolio-categories/{category_id}")
+async def delete_portfolio_category(category_id: str, super_admin: dict = Depends(require_super_admin)):
+    if category_id.startswith("default-"): raise HTTPException(status_code=400, detail="Default category cannot be deleted until master data is initialized")
+    cat = await db.portfolio_categories.find_one({"_id": ObjectId(category_id)})
+    if not cat: raise HTTPException(status_code=404, detail="Category not found")
+    count = await db.gallery.count_documents({"category": cat["name"]})
+    if count: raise HTTPException(status_code=400, detail=f"Category has {count} gallery image(s). Move or delete those images first, or disable the category.")
+    await db.portfolio_categories.delete_one({"_id": cat["_id"]})
+    return {"ok": True}
+
+DEFAULT_PACKAGE_CATEGORIES = ["Wedding", "Pre-wedding", "Portrait", "Event", "Commercial"]
+
+@api.get("/master/package-categories")
+async def list_package_categories(include_inactive: bool = False, user: dict = Depends(get_current_user)):
+    query = {} if (include_inactive and user.get("role") == "super_admin") else {"is_active": {"$ne": False}}
+    rows = await db.package_categories.find(query).sort([("sort_order", 1), ("name", 1)]).to_list(200)
+    if not rows:
+        return [{"id": f"default-package-{i}", "name": n, "sort_order": i + 1, "is_active": True} for i, n in enumerate(DEFAULT_PACKAGE_CATEGORIES)]
+    return [_media_doc(x) for x in rows]
+
+@api.post("/master/package-categories")
+async def create_package_category(body: PackageCategoryIn, super_admin: dict = Depends(require_super_admin)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Category name is required")
+    if await db.package_categories.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}}):
+        raise HTTPException(status_code=400, detail="Category already exists")
+    doc = {"name": name, "sort_order": body.sort_order, "is_active": body.is_active, "created_at": now_iso()}
+    result = await db.package_categories.insert_one(doc); doc["_id"] = result.inserted_id
+    return serialize(doc)
+
+@api.patch("/master/package-categories/{category_id}")
+async def update_package_category(category_id: str, body: PackageCategoryUpdate, super_admin: dict = Depends(require_super_admin)):
+    if category_id.startswith("default-package-"):
+        raise HTTPException(status_code=400, detail="Default categories are initialized when the backend starts. Restart once, then edit them.")
+    old = await db.package_categories.find_one({"_id": ObjectId(category_id)})
+    if not old:
+        raise HTTPException(status_code=404, detail="Category not found")
+    updates = {k:v for k,v in body.model_dump().items() if v is not None}
+    if "name" in updates:
+        updates["name"] = updates["name"].strip()
+        if not updates["name"]:
+            raise HTTPException(status_code=400, detail="Category name is required")
+        duplicate = await db.package_categories.find_one({"_id": {"$ne": old["_id"]}, "name": {"$regex": f"^{updates['name']}$", "$options": "i"}})
+        if duplicate:
+            raise HTTPException(status_code=400, detail="Category already exists")
+        await db.packages.update_many({"category": old["name"]}, {"$set": {"category": updates["name"]}})
+    updates["updated_at"] = now_iso()
+    await db.package_categories.update_one({"_id": old["_id"]}, {"$set": updates})
+    return serialize(await db.package_categories.find_one({"_id": old["_id"]}))
+
+@api.delete("/master/package-categories/{category_id}")
+async def delete_package_category(category_id: str, super_admin: dict = Depends(require_super_admin)):
+    if category_id.startswith("default-package-"):
+        raise HTTPException(status_code=400, detail="Default category cannot be deleted until master data is initialized")
+    cat = await db.package_categories.find_one({"_id": ObjectId(category_id)})
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+    count = await db.packages.count_documents({"category": cat["name"]})
+    if count:
+        raise HTTPException(status_code=400, detail=f"Category is used by {count} package(s). Move those packages first, or disable the category.")
+    await db.package_categories.delete_one({"_id": cat["_id"]})
+    return {"ok": True}
+
+@api.get("/super-admin/users")
+async def list_super_admins(super_admin: dict = Depends(require_super_admin)):
+    return [serialize(x) for x in await db.users.find({"role":"super_admin"}).to_list(50)]
+
+@api.post("/super-admin/users")
+async def create_super_admin(body: SuperAdminCreate, super_admin: dict = Depends(require_super_admin)):
+    if len(body.password) < 8: raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    email=body.email.lower()
+    if await db.users.find_one({"email":email}): raise HTTPException(status_code=400, detail="Email already exists")
+    doc={"name":body.name,"email":email,"mobile":body.mobile,"password_hash":hash_password(body.password),"role":"super_admin","created_at":now_iso()}
+    r=await db.users.insert_one(doc); doc["_id"]=r.inserted_id
+    return serialize(doc)
+
+# ---------- Blog ----------
+@api.get("/blogs")
+async def list_blogs():
+    rows = await db.blog_posts.find({"is_active": {"$ne": False}}).sort("created_at", -1).to_list(100)
+    return [_media_doc(x) for x in rows]
+
+@api.get("/blogs/{slug}")
+async def get_blog(slug: str):
+    row = await db.blog_posts.find_one({"slug": slug, "is_active": {"$ne": False}})
+    if not row: raise HTTPException(status_code=404, detail="Blog post not found")
+    return _media_doc(row)
+
+@api.post("/blogs")
+async def create_blog(body: BlogPostIn, admin: dict = Depends(require_admin)):
+    if await db.blog_posts.find_one({"slug": body.slug}): raise HTTPException(status_code=400, detail="Slug already exists")
+    doc=body.model_dump(); doc["created_at"]=now_iso()
+    r=await db.blog_posts.insert_one(doc); doc["_id"]=r.inserted_id
+    return _media_doc(doc)
+
+@api.delete("/blogs/{post_id}")
+async def delete_blog(post_id: str, admin: dict = Depends(require_admin)):
+    r=await db.blog_posts.delete_one({"_id":ObjectId(post_id)})
+    if not r.deleted_count: raise HTTPException(status_code=404, detail="Blog post not found")
+    return {"ok":True}
+
+# ---------- Client Reviews ----------
+@api.get("/reviews")
+async def list_reviews():
+    rows=await db.reviews.find({"is_active":{"$ne":False}}).sort("created_at",-1).to_list(100)
+    return [_media_doc(x) for x in rows]
+
+@api.post("/reviews")
+async def create_review(body: ReviewIn):
+    doc=body.model_dump(); doc["created_at"]=now_iso()
+    r=await db.reviews.insert_one(doc); doc["_id"]=r.inserted_id
+    return _media_doc(doc)
+
+@api.delete("/reviews/{review_id}")
+async def delete_review(review_id: str, admin: dict = Depends(require_admin)):
+    r=await db.reviews.delete_one({"_id":ObjectId(review_id)})
+    if not r.deleted_count: raise HTTPException(status_code=404, detail="Review not found")
+    return {"ok":True}
+
+# ---------- Website Gallery (separate from Portfolio) ----------
+@api.get("/website-gallery")
+async def list_website_gallery(category: Optional[str] = None):
+    query = {"is_active": {"$ne": False}}
+    if category: query["category"] = category
+    images = await db.website_gallery.find(query).sort("created_at", -1).to_list(500)
+    return [_media_doc(i) for i in images]
+
+@api.get("/website-gallery/admin/all")
+async def list_website_gallery_admin(admin: dict = Depends(require_admin)):
+    return [_media_doc(i) for i in await db.website_gallery.find({}).sort("created_at", -1).to_list(200)]
+
+@api.post("/website-gallery")
+async def upload_website_gallery(body: GalleryImageIn, admin: dict = Depends(require_admin)):
+    doc = body.model_dump(); doc["is_active"] = True; doc["created_at"] = now_iso()
+    result = await db.website_gallery.insert_one(doc); doc["_id"] = result.inserted_id
+    return _media_doc(doc)
+
+@api.patch("/website-gallery/{image_id}")
+async def update_website_gallery(image_id: str, body: GalleryImageUpdate, admin: dict = Depends(require_admin)):
+    updates={k:v for k,v in body.model_dump().items() if v is not None}; updates["updated_at"]=now_iso()
+    result=await db.website_gallery.update_one({"_id":ObjectId(image_id)},{"$set":updates})
+    if result.matched_count==0: raise HTTPException(status_code=404, detail="Not found")
+    return _media_doc(await db.website_gallery.find_one({"_id":ObjectId(image_id)}))
+
+@api.delete("/website-gallery/{image_id}")
+async def delete_website_gallery(image_id: str, admin: dict = Depends(require_admin)):
+    result = await db.website_gallery.delete_one({"_id": ObjectId(image_id)})
+    if result.deleted_count == 0: raise HTTPException(status_code=404, detail="Not found")
+    return {"ok": True}
+
 @api.get("/gallery")
 async def list_gallery(category: Optional[str] = None):
-    query = {"category": category} if category else {}
+    query = {"is_active": {"$ne": False}}
+    if category: query["category"] = category
     images = await db.gallery.find(query).sort("created_at", -1).to_list(500)
-    return [serialize(i) for i in images]
+    return [_media_doc(i) for i in images]
 
+@api.get("/gallery/admin/all")
+async def list_gallery_admin(admin: dict = Depends(require_admin)):
+    return [_media_doc(i) for i in await db.gallery.find({}).sort("created_at", -1).to_list(200)]
 
 @api.post("/gallery")
 async def upload_gallery(body: GalleryImageIn, admin: dict = Depends(require_admin)):
-    doc = body.model_dump()
-    doc["created_at"] = now_iso()
-    result = await db.gallery.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return serialize(doc)
+    doc = body.model_dump(); doc["is_active"] = True; doc["created_at"] = now_iso()
+    result = await db.gallery.insert_one(doc); doc["_id"] = result.inserted_id
+    return _media_doc(doc)
 
+@api.patch("/gallery/{image_id}")
+async def update_gallery(image_id: str, body: GalleryImageUpdate, admin: dict = Depends(require_admin)):
+    updates={k:v for k,v in body.model_dump().items() if v is not None}; updates["updated_at"]=now_iso()
+    result=await db.gallery.update_one({"_id":ObjectId(image_id)},{"$set":updates})
+    if result.matched_count==0: raise HTTPException(status_code=404, detail="Not found")
+    return _media_doc(await db.gallery.find_one({"_id":ObjectId(image_id)}))
 
 @api.delete("/gallery/{image_id}")
 async def delete_gallery(image_id: str, admin: dict = Depends(require_admin)):
     result = await db.gallery.delete_one({"_id": ObjectId(image_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Not found")
+    if result.deleted_count == 0: raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True}
+
+
+# ---------- Reels (public + Super Admin management) ----------
+@api.get("/reels")
+async def list_reels():
+    rows = await db.reels.find({"is_active": {"$ne": False}}).sort("created_at", -1).to_list(100)
+    return [_media_doc(x) for x in rows]
+
+@api.get("/reels/admin/all")
+async def list_reels_admin(admin: dict = Depends(require_super_admin)):
+    return [_media_doc(x) for x in await db.reels.find({}).sort("created_at", -1).to_list(100)]
+
+@api.post("/reels")
+async def create_reel(body: ReelIn, admin: dict = Depends(require_super_admin)):
+    doc=body.model_dump(); doc["created_at"]=now_iso(); r=await db.reels.insert_one(doc); doc["_id"]=r.inserted_id; return _media_doc(doc)
+
+@api.patch("/reels/{reel_id}")
+async def update_reel(reel_id: str, body: ReelUpdate, admin: dict = Depends(require_super_admin)):
+    updates={k:v for k,v in body.model_dump().items() if v is not None}; updates["updated_at"]=now_iso()
+    await db.reels.update_one({"_id":ObjectId(reel_id)},{"$set":updates})
+    row=await db.reels.find_one({"_id":ObjectId(reel_id)});
+    if not row: raise HTTPException(status_code=404, detail="Not found")
+    return _media_doc(row)
+
+@api.delete("/reels/{reel_id}")
+async def delete_reel(reel_id: str, admin: dict = Depends(require_super_admin)):
+    r=await db.reels.delete_one({"_id":ObjectId(reel_id)})
+    if not r.deleted_count: raise HTTPException(status_code=404, detail="Not found")
+    return {"ok":True}
 
 
 # ---------- Stats (Admin dashboard) ----------
@@ -1244,7 +1592,7 @@ async def client_scan(token: str = Form(...)):
         key="client_token",
         value=token,
         httponly=True,
-        secure=False,
+        secure=os.getenv("COOKIE_SECURE", "true").lower() == "true",
         samesite="lax",
         max_age=60 * 60 * 24 * 30,
         path="/",
@@ -1431,7 +1779,12 @@ app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://weddingtouch.in",
+        "https://www.weddingtouch.in",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1487,6 +1840,9 @@ async def startup_event():
     await db.users.create_index("email", unique=True)
     await db.bookings.create_index("created_at")
     await db.gallery.create_index("category")
+    await db.website_gallery.create_index("category")
+    await db.blog_posts.create_index("slug", unique=True)
+    await db.reviews.create_index("created_at")
     await db.event_photos.create_index("event_id")
     await db.face_encodings.create_index("event_id")
     await db.face_encodings.create_index("photo_id")
@@ -1514,6 +1870,30 @@ async def startup_event():
             await db.users.update_one(
                 {"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}}
             )
+
+    # Seed package category master data
+    await db.package_categories.create_index("name", unique=True)
+    if await db.package_categories.count_documents({}) == 0:
+        existing_package_categories = await db.packages.distinct("category")
+        names = [x for x in existing_package_categories if x] or DEFAULT_PACKAGE_CATEGORIES
+        for idx, name in enumerate(names, 1):
+            await db.package_categories.insert_one({"name": name, "sort_order": idx, "is_active": True, "created_at": now_iso()})
+
+    # Seed portfolio category master data
+    await db.portfolio_categories.create_index("name", unique=True)
+    if await db.portfolio_categories.count_documents({}) == 0:
+        for idx, name in enumerate(DEFAULT_PORTFOLIO_CATEGORIES, 1):
+            await db.portfolio_categories.insert_one({"name": name, "sort_order": idx, "is_active": True, "created_at": now_iso()})
+
+    # Optional first Super Admin bootstrap. Configure both variables in Render/local .env.
+    super_email = os.environ.get("SUPER_ADMIN_EMAIL", "").strip().lower()
+    super_password = os.environ.get("SUPER_ADMIN_PASSWORD", "").strip()
+    if super_email and super_password:
+        existing_super = await db.users.find_one({"email": super_email})
+        if not existing_super:
+            await db.users.insert_one({"name": os.environ.get("SUPER_ADMIN_NAME", "Wedding Touch Owner"), "email": super_email, "password_hash": hash_password(super_password), "role": "super_admin", "created_at": now_iso()})
+        elif existing_super.get("role") != "super_admin":
+            await db.users.update_one({"_id": existing_super["_id"]}, {"$set": {"role": "super_admin"}})
 
     # Seed packages if empty
     pkg_count = await db.packages.count_documents({})
