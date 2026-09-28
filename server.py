@@ -938,6 +938,21 @@ async def create_review(body: ReviewIn):
     r=await db.reviews.insert_one(doc); doc["_id"]=r.inserted_id
     return _media_doc(doc)
 
+@api.get("/reviews/admin/all")
+async def list_reviews_admin(admin: dict = Depends(require_admin)):
+    rows = await db.reviews.find({}).sort("created_at", -1).to_list(500)
+    return [_media_doc(x) for x in rows]
+
+@api.patch("/reviews/{review_id}")
+async def update_review(review_id: str, body: dict, admin: dict = Depends(require_admin)):
+    updates = {}
+    if "is_active" in body: updates["is_active"] = bool(body["is_active"])
+    if not updates: raise HTTPException(status_code=400, detail="No supported fields supplied")
+    updates["updated_at"] = now_iso()
+    result = await db.reviews.update_one({"_id": ObjectId(review_id)}, {"$set": updates})
+    if not result.matched_count: raise HTTPException(status_code=404, detail="Review not found")
+    return _media_doc(await db.reviews.find_one({"_id": ObjectId(review_id)}))
+
 @api.delete("/reviews/{review_id}")
 async def delete_review(review_id: str, admin: dict = Depends(require_admin)):
     r=await db.reviews.delete_one({"_id":ObjectId(review_id)})
