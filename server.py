@@ -216,7 +216,7 @@ class BookingUpdate(BaseModel):
 
 
 class GalleryImageIn(BaseModel):
-    title: str
+    title: Optional[str] = ""
     category: str
     image_data: Optional[str] = None  # legacy/base64 compatibility
     image_key: Optional[str] = None
