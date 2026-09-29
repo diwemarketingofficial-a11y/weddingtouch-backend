@@ -917,6 +917,11 @@ async def list_blogs():
     rows = await db.blog_posts.find({"is_active": {"$ne": False}}).sort("created_at", -1).to_list(100)
     return [_media_doc(x) for x in rows]
 
+@api.get("/blogs/admin/all")
+async def list_blogs_admin(admin: dict = Depends(require_admin)):
+    rows = await db.blog_posts.find({}).sort("created_at", -1).to_list(500)
+    return [_media_doc(x) for x in rows]
+
 @api.get("/blogs/{slug}")
 async def get_blog(slug: str):
     row = await db.blog_posts.find_one({"slug": slug, "is_active": {"$ne": False}})
