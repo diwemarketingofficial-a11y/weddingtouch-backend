@@ -274,6 +274,7 @@ class BlogPostIn(BaseModel):
     slug: str
     excerpt: str
     content: str
+    image_data: Optional[str] = None  # DB fallback when R2 is unavailable
     image_key: Optional[str] = None
     tag: Optional[str] = "Guide"
     is_active: bool = True
@@ -567,9 +568,18 @@ async def upload_website_media(
         img.save(out, format="WEBP", quality=78, method=4, optimize=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid image: {exc}")
+    optimized = out.getvalue()
     key = f"website/{kind}/{uuid.uuid4().hex}.webp"
-    await asyncio.to_thread(r2_upload_file, out.getvalue(), key, "image/webp")
-    return {"image_key": key, "image_url": create_download_url(key, expires_in=86400), "bytes": len(out.getvalue())}
+    try:
+        await asyncio.to_thread(r2_upload_file, optimized, key, "image/webp")
+        return {"image_key": key, "image_data": None, "image_url": create_download_url(key, expires_in=86400), "storage": "r2", "bytes": len(optimized)}
+    except Exception as exc:
+        # Keep website administration usable if R2 credentials/bucket/network are
+        # temporarily unavailable. Optimized WebP is small enough for MongoDB and
+        # existing public serializers already support image_data.
+        logging.exception("R2 website-media upload failed; using database fallback")
+        data_url = "data:image/webp;base64," + base64.b64encode(optimized).decode("ascii")
+        return {"image_key": None, "image_data": data_url, "image_url": data_url, "storage": "database", "storage_warning": str(exc), "bytes": len(optimized)}
 
 # ---------- Package Routes ----------
 @api.get("/packages")
