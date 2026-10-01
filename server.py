@@ -439,8 +439,10 @@ async def update_team_member(member_id: str, body: TeamMemberUpdate, admin: dict
     if requested_balance is not None:
         old_balance = float(member.get("main_balance", member.get("monthly_payment", 0)) or 0)
         new_balance = float(requested_balance)
+        if new_balance < old_balance:
+            raise HTTPException(status_code=400, detail="Main balance can only be increased, not decreased")
         updates["main_balance"] = new_balance
-        if new_balance != old_balance:
+        if new_balance > old_balance:
             await db.team_payments.insert_one({
                 "member_id": member_id,
                 "transaction_type": "balance_adjustment",
@@ -448,7 +450,7 @@ async def update_team_member(member_id: str, body: TeamMemberUpdate, admin: dict
                 "balance_before": old_balance,
                 "balance_after": new_balance,
                 "pay_date": now_iso()[:10],
-                "notes": "Main balance updated by admin",
+                "notes": "Main balance increased by admin",
                 "created_by": admin["id"],
                 "created_at": now_iso(),
             })
