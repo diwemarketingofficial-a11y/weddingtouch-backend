@@ -149,7 +149,8 @@ class TeamMemberCreate(BaseModel):
     team_part: Optional[str] = None
     work_role: Optional[str] = None
     joining_date: Optional[str] = None
-    monthly_payment: float = 0.0
+    main_balance: float = 0.0
+    monthly_payment: Optional[float] = None  # legacy compatibility
     payment_details: Optional[str] = None
 
 
@@ -161,7 +162,8 @@ class TeamMemberUpdate(BaseModel):
     team_part: Optional[str] = None
     work_role: Optional[str] = None
     joining_date: Optional[str] = None
-    monthly_payment: Optional[float] = None
+    main_balance: Optional[float] = None
+    monthly_payment: Optional[float] = None  # legacy compatibility
     payment_details: Optional[str] = None
 
 
@@ -172,9 +174,13 @@ class TeamPasswordResetIn(BaseModel):
 class TeamPaymentIn(BaseModel):
     amount: float
     pay_date: str
-    month: str
+    month: Optional[str] = None
     payment_method: Optional[str] = None
     reference: Optional[str] = None
+    notes: Optional[str] = None
+
+class TeamBalanceUpdateIn(BaseModel):
+    main_balance: float
     notes: Optional[str] = None
 
 
@@ -354,7 +360,11 @@ async def my_team_payments(
     to_date: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    query = {"member_id": user["id"]}
+    member_id = user["id"]
+    member = await db.users.find_one({"_id": ObjectId(member_id)})
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    query = {"member_id": member_id}
     if from_date or to_date:
         date_query = {}
         if from_date:
@@ -362,9 +372,18 @@ async def my_team_payments(
         if to_date:
             date_query["$lte"] = to_date
         query["pay_date"] = date_query
-    payments = await db.team_payments.find(query).sort("pay_date", -1).to_list(1000)
-    total = sum(float(p.get("amount") or 0) for p in payments)
-    return {"payments": [serialize(p) for p in payments], "total_received": total}
+    history = await db.team_payments.find(query).sort([("pay_date", -1), ("created_at", -1)]).to_list(1000)
+    all_payments = await db.team_payments.find({"member_id": member_id, "transaction_type": {"$in": [None, "payment"]}}).to_list(5000)
+    total_paid = sum(float(p.get("amount") or 0) for p in all_payments)
+    main_balance = float(member.get("main_balance", member.get("monthly_payment", 0)) or 0)
+    return {
+        "payments": [serialize(p) for p in history],
+        "history": [serialize(p) for p in history],
+        "main_balance": main_balance,
+        "total_paid": total_paid,
+        "current_due": max(main_balance - total_paid, 0),
+        "total_received": total_paid,
+    }
 
 
 @api.post("/team")
@@ -373,6 +392,7 @@ async def create_team_member(body: TeamMemberCreate, admin: dict = Depends(requi
     existing = await db.users.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
+    opening_balance = float(body.main_balance if body.main_balance is not None else (body.monthly_payment or 0))
     doc = {
         "name": body.name,
         "email": email,
@@ -383,32 +403,77 @@ async def create_team_member(body: TeamMemberCreate, admin: dict = Depends(requi
         "team_part": body.team_part,
         "work_role": body.work_role,
         "joining_date": body.joining_date,
-        "monthly_payment": body.monthly_payment,
+        "main_balance": opening_balance,
         "payment_details": body.payment_details,
         "created_at": now_iso(),
     }
     result = await db.users.insert_one(doc)
     doc["_id"] = result.inserted_id
+    if opening_balance != 0:
+        await db.team_payments.insert_one({
+            "member_id": str(result.inserted_id),
+            "transaction_type": "balance_adjustment",
+            "amount": opening_balance,
+            "balance_before": 0.0,
+            "balance_after": opening_balance,
+            "pay_date": now_iso()[:10],
+            "notes": "Opening main balance",
+            "created_by": admin["id"],
+            "created_at": now_iso(),
+        })
     return serialize(doc)
 
 
 @api.patch("/team/{member_id}")
 async def update_team_member(member_id: str, body: TeamMemberUpdate, admin: dict = Depends(require_admin)):
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if updates.get("role") not in (None, "admin", "team"):
-        updates["role"] = "team"
-    updates["updated_at"] = now_iso()
-    await db.users.update_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}}, {"$set": updates})
     member = await db.users.find_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}})
     if not member:
         raise HTTPException(status_code=404, detail="Team member not found")
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    requested_balance = updates.pop("main_balance", None)
+    legacy_balance = updates.pop("monthly_payment", None)
+    if requested_balance is None and legacy_balance is not None:
+        requested_balance = legacy_balance
+    if updates.get("role") not in (None, "admin", "team"):
+        updates["role"] = "team"
+    if requested_balance is not None:
+        old_balance = float(member.get("main_balance", member.get("monthly_payment", 0)) or 0)
+        new_balance = float(requested_balance)
+        updates["main_balance"] = new_balance
+        if new_balance != old_balance:
+            await db.team_payments.insert_one({
+                "member_id": member_id,
+                "transaction_type": "balance_adjustment",
+                "amount": new_balance - old_balance,
+                "balance_before": old_balance,
+                "balance_after": new_balance,
+                "pay_date": now_iso()[:10],
+                "notes": "Main balance updated by admin",
+                "created_by": admin["id"],
+                "created_at": now_iso(),
+            })
+    updates["updated_at"] = now_iso()
+    await db.users.update_one({"_id": ObjectId(member_id)}, {"$set": updates, "$unset": {"monthly_payment": ""}})
+    member = await db.users.find_one({"_id": ObjectId(member_id)})
     return serialize(member)
 
 
 @api.get("/team/{member_id}/payments")
 async def list_team_payments(member_id: str, admin: dict = Depends(require_admin)):
-    payments = await db.team_payments.find({"member_id": member_id}).sort("pay_date", -1).to_list(500)
-    return [serialize(x) for x in payments]
+    member = await db.users.find_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}})
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    history = await db.team_payments.find({"member_id": member_id}).sort([("pay_date", -1), ("created_at", -1)]).to_list(1000)
+    paid_docs = [p for p in history if p.get("transaction_type") in (None, "payment")]
+    total_paid = sum(float(p.get("amount") or 0) for p in paid_docs)
+    main_balance = float(member.get("main_balance", member.get("monthly_payment", 0)) or 0)
+    return {
+        "history": [serialize(x) for x in history],
+        "payments": [serialize(x) for x in paid_docs],
+        "main_balance": main_balance,
+        "total_paid": total_paid,
+        "current_due": max(main_balance - total_paid, 0),
+    }
 
 
 @api.post("/team/{member_id}/payments")
@@ -416,8 +481,23 @@ async def add_team_payment(member_id: str, body: TeamPaymentIn, admin: dict = De
     member = await db.users.find_one({"_id": ObjectId(member_id), "role": {"$ne": "super_admin"}})
     if not member:
         raise HTTPException(status_code=404, detail="Team member not found")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Payment amount must be greater than zero")
+    history = await db.team_payments.find({"member_id": member_id}).to_list(5000)
+    total_paid = sum(float(p.get("amount") or 0) for p in history if p.get("transaction_type") in (None, "payment"))
+    main_balance = float(member.get("main_balance", member.get("monthly_payment", 0)) or 0)
+    due_before = max(main_balance - total_paid, 0)
+    if body.amount > due_before:
+        raise HTTPException(status_code=400, detail=f"Payment cannot exceed current due ({due_before:.2f})")
     doc = body.model_dump()
-    doc.update({"member_id": member_id, "created_at": now_iso()})
+    doc.update({
+        "member_id": member_id,
+        "transaction_type": "payment",
+        "due_before": due_before,
+        "due_after": max(due_before - float(body.amount), 0),
+        "created_by": admin["id"],
+        "created_at": now_iso(),
+    })
     result = await db.team_payments.insert_one(doc)
     doc["_id"] = result.inserted_id
     return serialize(doc)
