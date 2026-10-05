@@ -11,32 +11,60 @@ from googleapiclient.http import MediaIoBaseDownload
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
-def _credentials():
+def _load_credential_info():
+    # Prefer the explicitly refreshed Base64 credential over any legacy/raw value
+    # that may still exist on Render.
+    encoded = os.getenv("GDRIVE_JSON_B64", "").strip()
+    if encoded:
+        try:
+            decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            info = json.loads(decoded)
+        except Exception as exc:
+            raise RuntimeError("GDRIVE_JSON_B64 is not valid base64 service-account JSON") from exc
+        return info, "GDRIVE_JSON_B64"
+
     raw = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "").strip()
     if raw:
         try:
             info = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
-        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-    encoded = os.getenv("GDRIVE_JSON_B64", "").strip()
-    if encoded:
-        try:
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            info = json.loads(decoded)
-        except Exception as exc:
-            raise RuntimeError("GDRIVE_JSON_B64 is not valid service-account JSON") from exc
-        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        return info, "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON"
 
     secret_path = os.getenv(
         "GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE",
         "/etc/secrets/google-drive-service-account.json",
     )
     if os.path.isfile(secret_path):
-        return service_account.Credentials.from_service_account_file(secret_path, scopes=SCOPES)
+        try:
+            with open(secret_path, "r", encoding="utf-8") as fh:
+                info = json.load(fh)
+        except Exception as exc:
+            raise RuntimeError("Google Drive secret file is not valid JSON") from exc
+        return info, secret_path
 
     raise RuntimeError("Google Drive credentials are not configured")
+
+
+def credential_diagnostics():
+    info, source = _load_credential_info()
+    private_key = info.get("private_key", "") or ""
+    return {
+        "source": source,
+        "type": info.get("type"),
+        "project_id": info.get("project_id"),
+        "client_email": info.get("client_email"),
+        "private_key_id": info.get("private_key_id"),
+        "token_uri": info.get("token_uri"),
+        "private_key_has_pem_header": private_key.startswith("-----BEGIN PRIVATE KEY-----"),
+        "private_key_has_pem_footer": private_key.rstrip().endswith("-----END PRIVATE KEY-----"),
+        "private_key_length": len(private_key),
+    }
+
+
+def _credentials():
+    info, _ = _load_credential_info()
+    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
 def _service():
     return build("drive", "v3", credentials=_credentials(), cache_discovery=False)
