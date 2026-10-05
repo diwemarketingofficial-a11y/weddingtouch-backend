@@ -1,4 +1,5 @@
 import io
+import base64
 import json
 import os
 import re
@@ -19,15 +20,21 @@ def _credentials():
             raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
         return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
+    encoded = os.getenv("GDRIVE_JSON_B64", "").strip()
+    if encoded:
+        try:
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            info = json.loads(decoded)
+        except Exception as exc:
+            raise RuntimeError("GDRIVE_JSON_B64 is not valid service-account JSON") from exc
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+
     secret_path = os.getenv(
         "GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE",
         "/etc/secrets/google-drive-service-account.json",
     )
     if os.path.isfile(secret_path):
-        return service_account.Credentials.from_service_account_file(
-            secret_path,
-            scopes=SCOPES,
-        )
+        return service_account.Credentials.from_service_account_file(secret_path, scopes=SCOPES)
 
     raise RuntimeError("Google Drive credentials are not configured")
 
