@@ -12,14 +12,24 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 def _credentials():
     raw = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not raw:
-        raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is not configured")
-    try:
-        info = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    if raw:
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
+    secret_path = os.getenv(
+        "GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE",
+        "/etc/secrets/google-drive-service-account.json",
+    )
+    if os.path.isfile(secret_path):
+        return service_account.Credentials.from_service_account_file(
+            secret_path,
+            scopes=SCOPES,
+        )
+
+    raise RuntimeError("Google Drive credentials are not configured")
 
 def _service():
     return build("drive", "v3", credentials=_credentials(), cache_discovery=False)
