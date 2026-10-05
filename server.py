@@ -8,6 +8,7 @@ import asyncio
 import logging
 import tempfile
 import requests
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Annotated
 
@@ -1320,7 +1321,7 @@ async def process_drive_photo(photo_id: str, event_id: str, drive_file_id: str):
                 {"$set": {"processing_status": "processing", "processing_error": None}},
             )
             raw = await asyncio.to_thread(drive_download_file, drive_file_id)
-            width, height, locations, encodings = await asyncio.to_thread(process_image_bytes, raw)
+            width, height, locations, encodings = await run_face_processing(raw)
             now = now_iso()
             await db.face_encodings.delete_many({"photo_id": photo_id})
             docs = []
@@ -1490,8 +1491,15 @@ async def get_photo_content(photo_id: str, request: Request):
 
 
 
-# Limit face processing so many uploads do not overload the server
-FACE_PROCESSING_SEMAPHORE = asyncio.Semaphore(2)
+# Keep CPU-heavy dlib work out of the web process so login/API requests stay responsive.
+# One dedicated worker is intentional on the small Render instance.
+FACE_PROCESSING_SEMAPHORE = asyncio.Semaphore(1)
+FACE_PROCESS_POOL = ProcessPoolExecutor(max_workers=1)
+
+
+async def run_face_processing(raw: bytes):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(FACE_PROCESS_POOL, process_image_bytes, raw)
 
 
 async def process_registered_photo(
@@ -1521,10 +1529,7 @@ async def process_registered_photo(
             )
 
             # Detect faces + create encodings
-            width, height, locations, encodings = await asyncio.to_thread(
-                process_image_bytes,
-                raw,
-            )
+            width, height, locations, encodings = await run_face_processing(raw)
 
             now = now_iso()
 
@@ -2228,6 +2233,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    FACE_PROCESS_POOL.shutdown(wait=False, cancel_futures=True)
     client.close()
 
 
