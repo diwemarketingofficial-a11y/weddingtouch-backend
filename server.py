@@ -319,6 +319,16 @@ print("ENV_CHECK ADMIN_EMAIL:", bool(os.getenv("ADMIN_EMAIL")))
 print("ENV_CHECK ADMIN_PASSWORD:", bool(os.getenv("ADMIN_PASSWORD")))
 print("ENV_CHECK SUPER_ADMIN_EMAIL:", bool(os.getenv("SUPER_ADMIN_EMAIL")))
 print("ENV_CHECK SUPER_ADMIN_PASSWORD:", bool(os.getenv("SUPER_ADMIN_PASSWORD")))
+print("DB_CHECK DB_NAME:", DB_NAME)
+
+async def _log_db_counts():
+    try:
+        for _name in ["users", "bookings", "events", "event_photos", "gallery", "website_gallery", "packages"]:
+            _count = await db[_name].count_documents({})
+            print(f"DB_CHECK {_name}: {_count}")
+    except Exception as _exc:
+        print("DB_CHECK error:", type(_exc).__name__)
+
 
 
 # ---------- Auth Routes ----------
@@ -2144,6 +2154,7 @@ DEFAULT_PACKAGES = [
 
 @app.on_event("startup")
 async def startup_event():
+    await _log_db_counts()
     await db.users.create_index("email", unique=True)
     await db.bookings.create_index("created_at")
     await db.gallery.create_index("category")
