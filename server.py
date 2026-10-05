@@ -1283,7 +1283,8 @@ async def get_event(event_id: str, user: dict = Depends(get_current_user)):
     return serialize(e)
 def _event_photo_url(photo: dict) -> Optional[str]:
     if photo.get("storage") == "google_drive" and photo.get("drive_file_id"):
-        return f"/api/photos/{str(photo.get('_id') or photo.get('id'))}/content"
+        api_base = os.getenv("PUBLIC_API_BASE_URL", "https://api.weddingtouch.in").rstrip("/")
+        return f"{api_base}/api/photos/{str(photo.get('_id') or photo.get('id'))}/content"
     if photo.get("r2_key"):
         try:
             return create_download_url(photo["r2_key"], expires_in=3600)
