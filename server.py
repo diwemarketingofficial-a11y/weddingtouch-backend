@@ -1950,8 +1950,9 @@ async def client_list_photos(claims: dict = Depends(get_client)):
     out = []
     for p in photos:
         item = serialize(p)
-        if p.get("r2_key"):
-            item["image_url"] = create_download_url(p["r2_key"], expires_in=3600)
+        image_url = _event_photo_url(p)
+        if image_url:
+            item["image_url"] = image_url
         out.append(item)
     return out
 
@@ -2007,8 +2008,9 @@ async def client_search_by_selfie(
     for p in photos:
         sp = serialize(p)
         sp["distance"] = photo_scores.get(str(p["_id"]))
-        if p.get("r2_key"):
-            sp["image_url"] = create_download_url(p["r2_key"], expires_in=3600)
+        image_url = _event_photo_url(p)
+        if image_url:
+            sp["image_url"] = image_url
         out.append(sp)
     out.sort(key=lambda x: x.get("distance", 999))
     return {"matches": out, "threshold": threshold, "total_faces_scanned": len(stored)}
