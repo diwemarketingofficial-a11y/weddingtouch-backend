@@ -1335,11 +1335,19 @@ async def process_drive_photo(photo_id: str, event_id: str, drive_file_id: str):
 @api.get("/debug/google-drive-env")
 async def debug_google_drive_env(admin: dict = Depends(require_admin)):
     raw = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")
+    matching_keys = sorted(
+        key for key in os.environ.keys()
+        if "GOOGLE" in key.upper() or "DRIVE" in key.upper()
+    )
     return {
         "configured": bool(raw and raw.strip()),
         "length": len(raw) if raw else 0,
         "starts_with_brace": bool(raw and raw.lstrip().startswith("{")),
         "ends_with_brace": bool(raw and raw.rstrip().endswith("}")),
+        "matching_env_keys": matching_keys,
+        "render_service_name": os.getenv("RENDER_SERVICE_NAME"),
+        "render_external_hostname": os.getenv("RENDER_EXTERNAL_HOSTNAME"),
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
     }
 
 
