@@ -311,6 +311,8 @@ class SuperAdminCreate(BaseModel):
 # ---------- App ----------
 app = FastAPI()
 api = APIRouter(prefix="/api")
+print("ENV_CHECK TEST_RENDER_ENV:", bool(os.getenv("TEST_RENDER_ENV")))
+print("ENV_CHECK GDRIVE_JSON_B64:", bool(os.getenv("GDRIVE_JSON_B64")))
 
 
 # ---------- Auth Routes ----------
