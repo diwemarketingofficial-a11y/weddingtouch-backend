@@ -1349,11 +1349,12 @@ async def debug_google_drive_env(admin: dict = Depends(require_admin)):
 
     matching_keys = sorted(
         key for key in os.environ.keys()
-        if "GOOGLE" in key.upper() or "DRIVE" in key.upper()
+        if "GOOGLE" in key.upper() or "DRIVE" in key.upper() or key == "TEST_RENDER_ENV"
     )
 
     return {
         "configured_env": bool(raw and raw.strip()),
+        "test_render_env_present": os.getenv("TEST_RENDER_ENV") is not None,
         "env_length": len(raw) if raw else 0,
         "secret_path": secret_path,
         "secret_exists": secret_exists,
