@@ -34,3 +34,6 @@ setuptools<70
 pillow-heif>=0.16.0
 
 reportlab>=4.2.0
+
+google-api-python-client>=2.149.0
+google-auth>=2.35.0
