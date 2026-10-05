@@ -1332,6 +1332,17 @@ async def process_drive_photo(photo_id: str, event_id: str, drive_file_id: str):
             )
 
 
+@api.get("/debug/google-drive-env")
+async def debug_google_drive_env(admin: dict = Depends(require_admin)):
+    raw = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")
+    return {
+        "configured": bool(raw and raw.strip()),
+        "length": len(raw) if raw else 0,
+        "starts_with_brace": bool(raw and raw.lstrip().startswith("{")),
+        "ends_with_brace": bool(raw and raw.rstrip().endswith("}")),
+    }
+
+
 @api.post("/events/{event_id}/drive-folder")
 async def connect_event_drive_folder(
     event_id: str,
