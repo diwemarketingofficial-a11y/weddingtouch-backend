@@ -19,7 +19,7 @@ _fr = None
 # Max longer-side for face detection input. Phones produce 4000+ px images
 # that make HOG detection painfully slow AND less accurate on small faces
 # when the frame is huge. Downscale keeps quality and boosts detection.
-MAX_DETECTION_SIDE = 1600
+MAX_DETECTION_SIDE = 1200
 
 
 def _lib():
@@ -37,8 +37,15 @@ def _load_image_rgb(raw: bytes):
     reasonable size, and return an (RGB numpy array, orig_width, orig_height).
     """
     with Image.open(io.BytesIO(raw)) as im:
-        im.load()
         orig_w, orig_h = im.size
+        # Let Pillow's JPEG decoder decode close to our target size instead of
+        # fully decoding a 20-50 MP original first. This is a major speed/memory
+        # win for camera JPGs and does not touch the original file.
+        try:
+            im.draft("RGB", (MAX_DETECTION_SIDE, MAX_DETECTION_SIDE))
+        except Exception:
+            pass
+        im.load()
         # Normalize rotation from EXIF, then strip alpha
         im = ImageOps.exif_transpose(im)
         if im.mode != "RGB":
@@ -63,11 +70,13 @@ def process_image_bytes(raw: bytes):
     fr = _lib()
     image, orig_w, orig_h = _load_image_rgb(raw)
 
-    # First pass: fast HOG, no upsampling
-    locations = fr.face_locations(image, model="hog", number_of_times_to_upsample=1)
+    # Fast first pass. Upsampling multiplies HOG work heavily, so keep the
+    # normal path at zero upsampling and retry only when absolutely necessary.
+    locations = fr.face_locations(image, model="hog", number_of_times_to_upsample=0)
     if not locations:
-        # Retry with more upsampling — catches smaller faces
-        locations = fr.face_locations(image, model="hog", number_of_times_to_upsample=2)
+        # One fallback pass for small/far faces. This is intentionally capped
+        # at 1; the previous value of 2 made large wedding photos very slow.
+        locations = fr.face_locations(image, model="hog", number_of_times_to_upsample=1)
 
     encodings = fr.face_encodings(
         image, known_face_locations=locations, num_jitters=1, model="small"
