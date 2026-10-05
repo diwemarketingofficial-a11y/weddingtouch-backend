@@ -1335,21 +1335,35 @@ async def process_drive_photo(photo_id: str, event_id: str, drive_file_id: str):
 @api.get("/debug/google-drive-env")
 async def debug_google_drive_env(admin: dict = Depends(require_admin)):
     raw = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")
+    secret_path = os.getenv(
+        "GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE",
+        "/etc/secrets/google-drive-service-account.json",
+    )
+    secret_exists = os.path.isfile(secret_path)
+    secret_size = os.path.getsize(secret_path) if secret_exists else 0
+
+    try:
+        secret_files = sorted(os.listdir("/etc/secrets")) if os.path.isdir("/etc/secrets") else []
+    except Exception:
+        secret_files = []
+
     matching_keys = sorted(
         key for key in os.environ.keys()
         if "GOOGLE" in key.upper() or "DRIVE" in key.upper()
     )
+
     return {
-        "configured": bool(raw and raw.strip()),
-        "length": len(raw) if raw else 0,
-        "starts_with_brace": bool(raw and raw.lstrip().startswith("{")),
-        "ends_with_brace": bool(raw and raw.rstrip().endswith("}")),
+        "configured_env": bool(raw and raw.strip()),
+        "env_length": len(raw) if raw else 0,
+        "secret_path": secret_path,
+        "secret_exists": secret_exists,
+        "secret_size": secret_size,
+        "secret_files": secret_files,
         "matching_env_keys": matching_keys,
         "render_service_name": os.getenv("RENDER_SERVICE_NAME"),
         "render_external_hostname": os.getenv("RENDER_EXTERNAL_HOSTNAME"),
         "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
     }
-
 
 @api.post("/events/{event_id}/drive-folder")
 async def connect_event_drive_folder(
