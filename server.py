@@ -313,6 +313,12 @@ app = FastAPI()
 api = APIRouter(prefix="/api")
 print("ENV_CHECK TEST_RENDER_ENV:", bool(os.getenv("TEST_RENDER_ENV")))
 print("ENV_CHECK GDRIVE_JSON_B64:", bool(os.getenv("GDRIVE_JSON_B64")))
+print("ENV_CHECK MONGO_URL:", bool(os.getenv("MONGO_URL")))
+print("ENV_CHECK JWT_SECRET:", bool(os.getenv("JWT_SECRET")))
+print("ENV_CHECK ADMIN_EMAIL:", bool(os.getenv("ADMIN_EMAIL")))
+print("ENV_CHECK ADMIN_PASSWORD:", bool(os.getenv("ADMIN_PASSWORD")))
+print("ENV_CHECK SUPER_ADMIN_EMAIL:", bool(os.getenv("SUPER_ADMIN_EMAIL")))
+print("ENV_CHECK SUPER_ADMIN_PASSWORD:", bool(os.getenv("SUPER_ADMIN_PASSWORD")))
 
 
 # ---------- Auth Routes ----------
