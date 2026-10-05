@@ -63,7 +63,6 @@ def create_upload_url(
         Params={
             "Bucket": R2_BUCKET,
             "Key": key,
-            "ContentType": content_type,
         },
         ExpiresIn=expires_in,
     )
