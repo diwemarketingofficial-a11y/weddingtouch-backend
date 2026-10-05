@@ -28,6 +28,13 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field, BeforeValidator, ConfigDict
 
 from face_service import process_image_bytes, encode_selfie, match_encodings
+from google_drive_storage import (
+    extract_folder_id as drive_extract_folder_id,
+    list_images as drive_list_images,
+    download_file as drive_download_file,
+    get_file_metadata as drive_get_file_metadata,
+)
+
 from r2_storage import (
     upload_file as r2_upload_file,
     download_file as r2_download_file,
@@ -1182,6 +1189,10 @@ class EventCreate(BaseModel):
     match_threshold: float = 0.52  # face-match distance threshold
 
 
+class DriveFolderIn(BaseModel):
+    folder_url: str
+
+
 class AlbumSelectionIn(BaseModel):
     photo_ids: List[str]
 
@@ -1270,6 +1281,160 @@ async def get_event(event_id: str, user: dict = Depends(get_current_user)):
     if not e:
         raise HTTPException(status_code=404, detail="Event not found")
     return serialize(e)
+def _event_photo_url(photo: dict) -> Optional[str]:
+    if photo.get("storage") == "google_drive" and photo.get("drive_file_id"):
+        return f"/api/photos/{str(photo.get('_id') or photo.get('id'))}/content"
+    if photo.get("r2_key"):
+        try:
+            return create_download_url(photo["r2_key"], expires_in=3600)
+        except Exception:
+            logging.exception("Failed to create R2 download URL")
+    return None
+
+
+async def process_drive_photo(photo_id: str, event_id: str, drive_file_id: str):
+    async with FACE_PROCESSING_SEMAPHORE:
+        try:
+            await db.event_photos.update_one(
+                {"_id": ObjectId(photo_id)},
+                {"$set": {"processing_status": "processing", "processing_error": None}},
+            )
+            raw = await asyncio.to_thread(drive_download_file, drive_file_id)
+            width, height, locations, encodings = await asyncio.to_thread(process_image_bytes, raw)
+            now = now_iso()
+            await db.face_encodings.delete_many({"photo_id": photo_id})
+            docs = []
+            for enc, loc in zip(encodings, locations):
+                t, r, b, l = loc
+                docs.append({
+                    "event_id": event_id,
+                    "photo_id": photo_id,
+                    "model": "face_recognition-dlib-128-v1",
+                    "embedding": [float(x) for x in enc],
+                    "location": {"top": int(t), "right": int(r), "bottom": int(b), "left": int(l)},
+                    "created_at": now,
+                })
+            if docs:
+                await db.face_encodings.insert_many(docs)
+            await db.event_photos.update_one(
+                {"_id": ObjectId(photo_id)},
+                {"$set": {
+                    "width": width, "height": height, "face_count": len(encodings),
+                    "processing_status": "ready", "processing_error": None, "processed_at": now,
+                }},
+            )
+        except Exception as exc:
+            logging.exception("Google Drive face processing failed for %s", photo_id)
+            await db.event_photos.update_one(
+                {"_id": ObjectId(photo_id)},
+                {"$set": {"processing_status": "failed", "processing_error": str(exc)}},
+            )
+
+
+@api.post("/events/{event_id}/drive-folder")
+async def connect_event_drive_folder(
+    event_id: str,
+    body: DriveFolderIn,
+    admin: dict = Depends(require_admin),
+):
+    try:
+        event_oid = ObjectId(event_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid event ID")
+    if not await db.events.find_one({"_id": event_oid}):
+        raise HTTPException(status_code=404, detail="Event not found")
+    try:
+        folder_id = drive_extract_folder_id(body.folder_url)
+        files = await asyncio.to_thread(drive_list_images, folder_id)
+    except Exception as exc:
+        logging.exception("Could not read Google Drive folder")
+        raise HTTPException(status_code=400, detail=f"Could not read Google Drive folder: {exc}")
+
+    await db.events.update_one(
+        {"_id": event_oid},
+        {"$set": {"drive_folder_id": folder_id, "drive_folder_url": body.folder_url, "drive_connected_at": now_iso()}},
+    )
+
+    added = 0
+    skipped = 0
+    for item in files:
+        file_id = item["id"]
+        existing = await db.event_photos.find_one({"event_id": event_id, "drive_file_id": file_id})
+        if existing:
+            skipped += 1
+            continue
+        doc = {
+            "event_id": event_id,
+            "filename": item.get("name") or "drive-photo",
+            "content_type": item.get("mimeType") or "application/octet-stream",
+            "storage": "google_drive",
+            "drive_file_id": file_id,
+            "drive_folder_id": folder_id,
+            "width": None,
+            "height": None,
+            "face_count": 0,
+            "processing_status": "pending",
+            "processing_error": None,
+            "created_at": now_iso(),
+        }
+        result = await db.event_photos.insert_one(doc)
+        asyncio.create_task(process_drive_photo(str(result.inserted_id), event_id, file_id))
+        added += 1
+
+    return {"ok": True, "folder_id": folder_id, "found": len(files), "added": added, "skipped": skipped}
+
+
+@api.post("/events/{event_id}/drive-sync")
+async def sync_event_drive_folder(event_id: str, admin: dict = Depends(require_admin)):
+    event = await db.events.find_one({"_id": ObjectId(event_id)})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    folder_id = event.get("drive_folder_id")
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="No Google Drive folder connected")
+    return await connect_event_drive_folder(
+        event_id,
+        DriveFolderIn(folder_url=folder_id),
+        admin,
+    )
+
+
+@api.get("/photos/{photo_id}/content")
+async def get_photo_content(photo_id: str, request: Request):
+    # A photo may be requested either by an authenticated admin/team user or
+    # by a client holding the event QR cookie/token.
+    event_id = None
+    try:
+        user = await get_current_user(request)
+        if user:
+            event_id = None
+    except HTTPException:
+        try:
+            claims = await get_client(request)
+            event_id = claims.get("event_id")
+        except HTTPException:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+    photo = await db.event_photos.find_one({"_id": ObjectId(photo_id)})
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if event_id and photo.get("event_id") != event_id:
+        raise HTTPException(status_code=403, detail="Photo not available for this event")
+    if photo.get("storage") != "google_drive" or not photo.get("drive_file_id"):
+        raise HTTPException(status_code=400, detail="Photo is not stored in Google Drive")
+    try:
+        raw = await asyncio.to_thread(drive_download_file, photo["drive_file_id"])
+    except Exception as exc:
+        logging.exception("Could not download Google Drive photo")
+        raise HTTPException(status_code=502, detail=f"Could not download photo: {exc}")
+    return Response(
+        content=raw,
+        media_type=photo.get("content_type") or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
+
 # Limit face processing so many uploads do not overload the server
 FACE_PROCESSING_SEMAPHORE = asyncio.Semaphore(2)
 
@@ -1613,20 +1778,7 @@ async def list_event_photos(
     for photo in photos:
         photo = serialize(photo)
 
-        # Generate temporary Cloudflare R2 URL
-        r2_key = photo.get("r2_key")
-
-        if r2_key:
-            try:
-                photo["image_url"] = create_download_url(
-                    r2_key,
-                    expires_in=3600,
-                )
-            except Exception:
-                logging.exception("Failed to create R2 download URL")
-                photo["image_url"] = None
-        else:
-            photo["image_url"] = None
+        photo["image_url"] = _event_photo_url(photo)
 
         result.append(photo)
 
