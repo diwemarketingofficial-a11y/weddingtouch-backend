@@ -33,6 +33,7 @@ from google_drive_storage import (
     list_images as drive_list_images,
     download_file as drive_download_file,
     get_file_metadata as drive_get_file_metadata,
+    credential_diagnostics as drive_credential_diagnostics,
 )
 
 from r2_storage import (
@@ -1379,6 +1380,7 @@ async def debug_google_drive_env(admin: dict = Depends(require_admin)):
         "secret_size": secret_size,
         "secret_files": secret_files,
         "matching_env_keys": matching_keys,
+        "drive_credential": drive_credential_diagnostics(),
         "render_service_name": os.getenv("RENDER_SERVICE_NAME"),
         "render_external_hostname": os.getenv("RENDER_EXTERNAL_HOSTNAME"),
         "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
